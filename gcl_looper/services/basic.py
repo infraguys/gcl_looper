@@ -35,10 +35,10 @@ class BasicService(base.AbstractService):
 
     def _loop_iteration(self):
         iteration = self._iteration_number
-        LOG.debug("Iteration #%d", iteration)
+        LOG.debug("Iteration #%d started", iteration)
         try:
             self._iteration()
-            LOG.debug("Iteration #%d finished")
+            LOG.debug("Iteration #%d finished", iteration)
         except Exception:
             LOG.exception("Unexpected error during iteration #%d", iteration)
         finally:
