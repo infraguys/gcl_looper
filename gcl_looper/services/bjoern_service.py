@@ -62,7 +62,11 @@ class BjoernService(base.AbstractService):
 
     def _loop(self):
         LOG.info("Bjoern server: %s:%s", self._host, self._port)
-        bjoern.run()
+        try:
+            bjoern.run()
+        except KeyboardInterrupt:
+            # Just a clean stop on Ctrl+C...
+            pass
 
     def stop(self):
         raise NotImplementedError()
