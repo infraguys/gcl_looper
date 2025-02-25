@@ -47,14 +47,15 @@ class BjoernService(base.AbstractService):
         )
         return super()._setup()
 
-    def _exit_gracefully(self, frame):
+    def _exit_gracefully(self, signum, frame):
         # TODO(g.melikov): bjoern may have problems with exit on signals:
         #  - signals mangling with multiprocess
         #  - even if bjoern got our signal - it may not return before new
         #    client try to connect...
         #  - bjoern doesn't have graceful stop, beware!
-        sock, wsgi_app = bjoern._default_instance
-        sock.close()
+        if bjoern._default_instance:
+            sock, wsgi_app = bjoern._default_instance
+            sock.close()
         os.kill(os.getpid(), signal.SIGINT)
 
     def _subscribe_signals(self, handlers):
