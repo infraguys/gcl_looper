@@ -26,6 +26,8 @@ class AbstractService(abc.ABC):
 
     def __init__(self):
         super(AbstractService, self).__init__()
+        self._setups = []
+        self._finishes = []
         self._should_subscribe_signals = True
 
     @property
@@ -59,12 +61,21 @@ class AbstractService(abc.ABC):
         """Implement stop logic here"""
         raise NotImplementedError()
 
+    def add_setup(self, setup_func):
+        self._setups.append(setup_func)
+
     def _setup(self):
         LOG.info("Setup loop")
-        pass
+        for setup_func in self._setups:
+            setup_func()
+
+    def add_finishes(self, finish_func):
+        self._finishes.append(finish_func)
 
     def _finish(self):
         LOG.info("Finish loop")
+        for finish_func in self._finishes:
+            finish_func()
         pass
 
     def _get_sig_handlers(self):
