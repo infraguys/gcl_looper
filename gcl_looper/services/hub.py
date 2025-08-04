@@ -28,6 +28,7 @@ LOG = logging.getLogger(__name__)
 
 class ProcessHubService(basic.BasicService):
     _instance_class = multiprocessing.Process
+    __log_iteration__ = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
