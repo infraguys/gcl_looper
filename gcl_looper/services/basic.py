@@ -25,6 +25,7 @@ LOG = logging.getLogger(__name__)
 
 
 class BasicService(base.AbstractService):
+    __log_iteration__ = True
 
     def __init__(self, iter_min_period=1, iter_pause=0.1):
         super(BasicService, self).__init__()
@@ -35,10 +36,12 @@ class BasicService(base.AbstractService):
 
     def _loop_iteration(self):
         iteration = self._iteration_number
-        LOG.debug("Iteration #%d started", iteration)
+        if self.__log_iteration__:
+            LOG.debug("Iteration #%d started", iteration)
         try:
             self._iteration()
-            LOG.debug("Iteration #%d finished", iteration)
+            if self.__log_iteration__:
+                LOG.debug("Iteration #%d finished", iteration)
         except Exception:
             LOG.exception("Unexpected error during iteration #%d", iteration)
         finally:
