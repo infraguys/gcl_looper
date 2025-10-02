@@ -37,13 +37,25 @@ class BasicService(base.AbstractService):
     def _loop_iteration(self):
         iteration = self._iteration_number
         if self.__log_iteration__:
-            LOG.debug("Iteration #%d started", iteration)
+            LOG.debug(
+                "Iteration #%d started for %s",
+                iteration,
+                self.__class__.__name__,
+            )
         try:
             self._iteration()
             if self.__log_iteration__:
-                LOG.debug("Iteration #%d finished", iteration)
+                LOG.debug(
+                    "Iteration #%d finished for %s",
+                    iteration,
+                    self.__class__.__name__,
+                )
         except Exception:
-            LOG.exception("Unexpected error during iteration #%d", iteration)
+            LOG.exception(
+                "Unexpected error during iteration #%d for %s",
+                iteration,
+                self.__class__.__name__,
+            )
         finally:
             self._iteration_number += 1
 
