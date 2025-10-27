@@ -115,3 +115,83 @@ if __name__ == "__main__":
 ---------------------------
 
 * **`_iteration()`**: This method must be implemented by subclasses to perform the actual work at each iteration.
+
+### Launchpad Service
+
+Launchpad service is a service that can run multiple services and execute them sequentially. It's convenient when you have multiple services that need to be run in a specific order or the services aren't heavy and you don't want to use multiprocessing. Also it simplifies the configuration of the services.
+
+**Basic usage:**
+
+```python
+from gcl_looper.services import launchpad
+
+services = [
+    MyService(),
+    MyFiniteService(),
+]
+
+service = launchpad.LaunchpadService(services)
+service.start()
+```
+
+The most important part in the launchpad service is its configuration. In the configuration you specify how to run inner services, how to configure them and how to initialize them.
+
+**Configuration options:**
+
+* **`services`**: List of services to run. Each service can be specified as a string in the format `module.path:ServiceName::count` where `count` is optional and defaults to 1.
+* **`common_registrator_opts`**: Common options for all services. These options are passed to the service constructor.
+* **`common_initializer`**: Common initializer for all services. This initializer is called after the service is created and before it is started.
+* **`iter_min_period`**: Minimum period between iterations of the service loop.
+* **`iter_pause`**: Pause between iterations of the service loop.
+
+
+**Example:**
+
+```ini
+[DEFAULT]
+verbose = True
+debug = True
+
+[launchpad]
+services =
+    my_package.service_foo:FooService,
+    my_package.service_bar:BarService,
+    my_package.service_baz:BazService
+common_registrator_opts = my_package.service_common:common_opts
+common_initializer = my_package.service_common:common_init
+
+[my_package.service_foo:FooService]
+name = foo
+
+[my_package.service_bar:BarService]
+name = bar
+project_id = 123
+
+[my_package.service_baz:BazService]
+param1 = value1
+param2 = value2
+```
+
+**Example with multiple instances of the same service:**
+
+```ini
+[DEFAULT]
+verbose = True
+debug = True
+
+[launchpad]
+services =
+    my_package.service_foo:FooService,
+    my_package.service_bar:BarService::2
+
+[my_package.service_foo:FooService]
+name = foo
+
+[my_package.service_bar:BarService::0]
+name = bar0
+project_id = 123
+
+[my_package.service_bar:BarService::1]
+name = bar1
+project_id = 456
+```

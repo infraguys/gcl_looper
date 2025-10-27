@@ -66,7 +66,9 @@ class TestBasicService:
         mock_log.debug.assert_called_once()
         self.service._iteration.assert_called_once()
         mock_log.exception.assert_called_once_with(
-            "Unexpected error during iteration #%d", 0
+            "Unexpected error during iteration #%d for %s",
+            0,
+            self.service.__class__.__name__,
         )
         assert (
             self.service._iteration_number == 1
