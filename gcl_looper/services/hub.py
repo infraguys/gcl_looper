@@ -22,12 +22,11 @@ import sys
 from gcl_looper.services import base
 from gcl_looper.services import basic
 
-
 LOG = logging.getLogger(__name__)
 
 
 class ProcessHubService(basic.BasicService):
-    _instance_class = multiprocessing.Process
+    _instance_class = multiprocessing.get_context("fork").Process
     __log_iteration__ = False
 
     def __init__(self, *args, **kwargs):
@@ -56,9 +55,6 @@ class ProcessHubService(basic.BasicService):
                 return
 
     def _setup(self):
-        if sys.platform == "darwin" and sys.version_info >= (3, 8):
-            multiprocessing.set_start_method("fork")
-
         for service in self._services:
             instance = self._instance_class(target=service.start)
             self._instances[service] = instance

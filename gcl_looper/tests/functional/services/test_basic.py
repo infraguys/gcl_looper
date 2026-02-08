@@ -45,7 +45,9 @@ def run_service(value):
 
 def test_basic_service_iterations_and_stop():
     value = multiprocessing.Value("i", 0)
-    process = multiprocessing.Process(target=run_service, args=(value,))
+    process = multiprocessing.get_context("fork").Process(
+        target=run_service, args=(value,)
+    )
 
     process.start()
     # Allow some iterations to run
