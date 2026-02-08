@@ -48,7 +48,7 @@ class TestBjoernService:
         self.host = "127.0.0.1"
         self.port = 8082
 
-        process = multiprocessing.Process(
+        process = multiprocessing.get_context("fork").Process(
             target=run_service, args=(wsgi_app, self.host, self.port)
         )
         process.start()
