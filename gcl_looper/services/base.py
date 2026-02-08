@@ -18,7 +18,6 @@ import abc
 import logging
 import signal
 
-
 LOG = logging.getLogger(__name__)
 
 

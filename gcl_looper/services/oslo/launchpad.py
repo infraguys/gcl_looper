@@ -27,7 +27,6 @@ from gcl_looper import constants as c
 from gcl_looper.services import basic
 from gcl_looper.services.oslo import base as oslo_base
 
-
 LOG = logging.getLogger(__name__)
 DOMAIN = "launchpad"
 
