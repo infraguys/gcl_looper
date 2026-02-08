@@ -21,11 +21,14 @@ from gcl_looper.services import basic
 
 
 class TestService(basic.BasicService):
+    __test__ = False
+
     def _iteration(self):
         pass
 
 
 class TestFiniteService(basic.BasicService):
+    __test__ = False
     _countdown = 3
 
     def __init__(self, iter_min_period=0, iter_pause=0):
