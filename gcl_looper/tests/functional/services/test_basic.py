@@ -22,7 +22,6 @@ import logging
 
 from gcl_looper.services.basic import BasicService
 
-
 LOG = logging.getLogger(__name__)
 
 

@@ -20,7 +20,6 @@ import logging
 
 from gcl_looper.services.oslo import launchpad
 
-
 LOG = logging.getLogger(__name__)
 
 

@@ -22,7 +22,6 @@ import bjoern
 
 from gcl_looper.services import base
 
-
 LOG = logging.getLogger(__name__)
 
 

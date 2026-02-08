@@ -18,13 +18,11 @@ import logging
 import multiprocessing
 import os
 import requests
-from requests import exceptions
 import signal
 
 import pytest
 
 from gcl_looper.services import bjoern_service
-
 
 LOG = logging.getLogger(__name__)
 
