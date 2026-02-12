@@ -116,6 +116,49 @@ if __name__ == "__main__":
 
 * **`_iteration()`**: This method must be implemented by subclasses to perform the actual work at each iteration.
 
+### Process Hub service
+
+Process Hub allows running multiple services in separate processes. It's useful when you want to run multiple instances of a service (e.g., multiple API workers) or different services that should be isolated.
+
+**Security Feature: Privilege Downgrade**
+
+When using `ProcessHubService`, you can set `__mp_downgrade_user__` on a child service to automatically downgrade process privileges after the fork. This is a security best practice to minimize attack surface - start as root (if needed to bind to privileged ports), then downgrade to an unprivileged user.
+
+* **`__mp_downgrade_user__`**: Class attribute set to a username (e.g., `"nobody"`). When set, the child process will downgrade to this user after forking. Default is `None` (no downgrade).
+
+```python
+from gcl_looper.services import hub
+from gcl_looper.services import bjoern_service
+
+serv_hub = hub.ProcessHubService()
+
+# BjoernService has __mp_downgrade_user__ = "nobody" by default
+for _ in range(4):  # 4 workers
+    service = bjoern_service.BjoernService(
+        wsgi_app=my_app,
+        host="0.0.0.0",
+        port=80,  # Privileged port, needs root to bind
+        bjoern_kwargs=dict(reuse_port=True),
+    )
+    serv_hub.add_service(service)
+
+serv_hub.start()
+# Each worker starts as root to bind port 80, then downgrades to 'nobody'
+```
+
+**Note:** This feature only works on Linux and requires the process to start as root. The target user must exist on the system.
+
+**Manual Privilege Downgrade**
+
+You can also manually downgrade privileges using the utility function:
+
+```python
+from gcl_looper import utils
+
+# Downgrade to 'nobody' user
+utils.downgrade_user_group_privileges("nobody")
+```
+
 ### Launchpad Service
 
 Launchpad service is a service that can run multiple services and execute them sequentially. It's convenient when you have multiple services that need to be run in a specific order or the services aren't heavy and you don't want to use multiprocessing. Also it simplifies the configuration of the services.
