@@ -15,11 +15,16 @@
 #    under the License.
 from __future__ import annotations
 
+import logging
+import os
+import pwd
 import sys
 import importlib
 import typing as tp
 import configparser
 import importlib_metadata
+
+LOG = logging.getLogger(__name__)
 
 
 def cfg_load_module_attr(attr_path: str) -> tp.Any:
@@ -85,3 +90,40 @@ def load_from_entry_point(group: str, name: str) -> tp.Any:
             return ep.load()
 
     raise RuntimeError(f"No class '{name}' found in entry points {group}")
+
+
+def downgrade_user_group_privileges(user="nobody") -> None:
+    """
+    If running as root, permanently change the process user and group to the specified user.
+    """
+    if not sys.platform.startswith("linux"):
+        LOG.warning(
+            "downgrade_user_group_privileges: only supported on Linux."
+        )
+        return
+
+    current_uid = os.getuid()
+    if current_uid != 0:
+        LOG.warning(
+            "downgrade_user_group_privileges: only root can downgrade."
+        )
+        return
+
+    try:
+        pw_entry = pwd.getpwnam(user)
+    except KeyError:
+        raise KeyError(f"User {user} does not exist on this system")
+
+    target_uid = pw_entry.pw_uid
+    target_gid = pw_entry.pw_gid
+
+    os.setgroups([])
+
+    os.setgid(target_gid)
+
+    os.setuid(target_uid)
+
+    if os.getuid() != target_uid or os.getgid() != target_gid:
+        raise RuntimeError("Failed to drop privileges: verification failed")
+
+    LOG.info("Process owner was successfully downgraded to %s", user)
