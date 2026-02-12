@@ -28,6 +28,8 @@ LOG = logging.getLogger(__name__)
 class BjoernService(base.AbstractService):
     """Bjoern has it's own eventloop, so we don't need to loop explicitly"""
 
+    __mp_downgrade_user__ = "nobody"
+
     def __init__(self, wsgi_app, host, port, bjoern_kwargs=None):
         super(BjoernService, self).__init__()
         self._wsgi_app = wsgi_app
