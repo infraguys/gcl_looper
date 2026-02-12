@@ -17,16 +17,15 @@
 import multiprocessing
 import logging
 import threading
-import sys
 
 from gcl_looper.services import base
 from gcl_looper.services import basic
+from gcl_looper import utils
 
 LOG = logging.getLogger(__name__)
 
 
-class ProcessHubService(basic.BasicService):
-    _instance_class = multiprocessing.get_context("fork").Process
+class BasicHubService(basic.BasicService):
     __log_iteration__ = False
 
     def __init__(self, *args, **kwargs):
@@ -43,6 +42,31 @@ class ProcessHubService(basic.BasicService):
             raise ValueError(
                 "Service must implement the AbstractService interface."
             )
+
+    def _iteration(self):
+        raise NotImplementedError()
+
+    def _setup(self):
+        raise NotImplementedError()
+
+    def _stop_instance(self, service, instance):
+        raise NotImplementedError()
+
+    def stop(self):
+        raise NotImplementedError()
+
+
+class ProcessHubService(BasicHubService):
+    _instance_class = multiprocessing.get_context("fork").Process
+
+    def add_service(self, service):
+        if service.__mp_downgrade_user__:
+            service.add_setup(
+                lambda: utils.downgrade_user_group_privileges(
+                    service.__mp_downgrade_user__
+                )
+            )
+        super().add_service(service)
 
     def _iteration(self):
         for instance in self._instances.values():
@@ -81,6 +105,9 @@ class ProcessHubService(basic.BasicService):
 
 class ThreadHubService(ProcessHubService):
     _instance_class = threading.Thread
+
+    def add_service(self, service):
+        super(ProcessHubService, self).add_service(service)
 
     def _setup(self):
         # Threads can't hangle signals so we need to disable them
