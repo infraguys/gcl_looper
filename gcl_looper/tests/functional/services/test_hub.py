@@ -85,7 +85,7 @@ def test_mp_service_died(prepared_service):
     assert not instance.is_alive(), "Service did not stop gracefully"
     # Check that service's stop() method wasn't called
     assert prepared_service._value.value != -1
-    assert h._enabled == False
+    assert not h._enabled
 
 
 def test_mt_start_stop_services(prepared_service):

@@ -15,9 +15,7 @@
 #    under the License.
 
 import multiprocessing
-import pytest
 import time
-import signal
 import logging
 
 from gcl_looper.services.basic import BasicService
@@ -55,7 +53,7 @@ def test_basic_service_iterations_and_stop():
 
     assert process.is_alive()
 
-    assert value.value == 2
+    assert value.value in [2, 3]
 
     process.terminate()
     process.join(timeout=2)

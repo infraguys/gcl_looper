@@ -22,7 +22,6 @@ LOG = logging.getLogger(__name__)
 
 
 class AbstractService(abc.ABC):
-
     __mp_downgrade_user__ = None
 
     def __init__(self):

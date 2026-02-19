@@ -14,7 +14,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import pytest
 from unittest import mock
 
 from gcl_looper.services import basic
@@ -73,9 +72,7 @@ class TestBasicService:
             0,
             self.service.__class__.__name__,
         )
-        assert (
-            self.service._iteration_number == 1
-        )  # iteration number incremented
+        assert self.service._iteration_number == 1  # iteration number incremented
 
     def test_loop(self):
         self.service = TestFiniteService()
@@ -83,7 +80,7 @@ class TestBasicService:
         self.service.start()
 
         assert self.service._iteration_number == 3
-        assert self.service._enabled == False
+        assert not self.service._enabled
 
     @mock.patch("time.sleep", return_value=None)
     def test_iter_pause(self, time_sleep):

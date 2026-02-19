@@ -39,9 +39,7 @@ class BasicHubService(basic.BasicService):
         if isinstance(service, base.AbstractService):
             self._services.append(service)
         else:
-            raise ValueError(
-                "Service must implement the AbstractService interface."
-            )
+            raise ValueError("Service must implement the AbstractService interface.")
 
     def _iteration(self):
         raise NotImplementedError()
@@ -88,10 +86,8 @@ class ProcessHubService(BasicHubService):
         LOG.info("Stop child service(pid:%i)", instance.pid)
         try:
             instance.terminate()
-        except OSError as e:  # Process doesn't exist
-            LOG.exception(
-                "Failed to terminate child service, pid:%i", instance.pid
-            )
+        except OSError:  # Process doesn't exist
+            LOG.exception("Failed to terminate child service, pid:%i", instance.pid)
 
     def stop(self):
         LOG.info("Stop service")

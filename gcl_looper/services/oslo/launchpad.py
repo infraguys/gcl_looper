@@ -36,9 +36,7 @@ class ServiceType(enum.Enum):
     CONFIG = "config"
 
 
-def load_config(
-    args: list[str], conf: cfg.ConfigOpts | None = None
-) -> cfg.ConfigOpts:
+def load_config(args: list[str], conf: cfg.ConfigOpts | None = None) -> cfg.ConfigOpts:
     if conf is None:
         conf = cfg.ConfigOpts()
 
@@ -54,7 +52,6 @@ def load_config(
 
 
 class LaunchpadService(basic.BasicService, oslo_base.OsloConfigurableService):
-
     def __init__(
         self,
         services: tp.Collection[basic.BasicService],
@@ -218,14 +215,10 @@ class LaunchpadService(basic.BasicService, oslo_base.OsloConfigurableService):
                     section_name = f"{svc}::{i}" if count > 1 else svc
                     cfg.CONF.register_cli_opts(opts, section_name)
 
-                services_classes.append(
-                    (svc, svc_class, ServiceType.OPS, count)
-                )
+                services_classes.append((svc, svc_class, ServiceType.OPS, count))
             # Allow to load configuration manually for the service
             else:
-                services_classes.append(
-                    (svc, svc_class, ServiceType.CONFIG, count)
-                )
+                services_classes.append((svc, svc_class, ServiceType.CONFIG, count))
 
         # Use common initializer if specified
         if launchpad_cfg[DOMAIN].common_registrator_opts:
@@ -251,15 +244,11 @@ class LaunchpadService(basic.BasicService, oslo_base.OsloConfigurableService):
                 if svc_type == ServiceType.CONFIG:
                     svc = svc_class.svc_from_config(launchpad_cfg.config_file)
                 elif svc_type == ServiceType.OPS:
-                    section_name = (
-                        f"{svc_name}::{i}" if count > 1 else svc_name
-                    )
+                    section_name = f"{svc_name}::{i}" if count > 1 else svc_name
 
                     # Check if configuration section exists
                     if section_name not in cfg.CONF.list_all_sections():
-                        LOG.error(
-                            "Section %s not found in config", section_name
-                        )
+                        LOG.error("Section %s not found in config", section_name)
                         raise ValueError(
                             f"Section `{section_name}` for service "
                             f"`{svc_name}` not found in config"
