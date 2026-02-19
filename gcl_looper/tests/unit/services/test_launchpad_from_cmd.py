@@ -1,5 +1,4 @@
 import textwrap
-from unittest import mock
 
 import pytest
 from oslo_config import cfg
@@ -58,7 +57,7 @@ def test_from_cmd_line_ops_single(monkeypatch, tmp_path):
 
     ini = make_cfg(
         tmp_path,
-        f"""
+        """
         [launchpad]
         services = mock.module:OpsSvc
         iter_min_period = 0
@@ -94,7 +93,7 @@ def test_from_cmd_line_ops_count_2(monkeypatch, tmp_path):
 
     ini = make_cfg(
         tmp_path,
-        f"""
+        """
         [launchpad]
         services = mock.module:OpsSvc::2
         
@@ -137,7 +136,7 @@ def test_from_cmd_line_config_service(monkeypatch, tmp_path):
 
     ini = make_cfg(
         tmp_path,
-        f"""
+        """
         [launchpad]
         services = EntryConfig
         """,
@@ -163,7 +162,7 @@ def test_missing_section_raises(monkeypatch, tmp_path):
 
     ini = make_cfg(
         tmp_path,
-        f"""
+        """
         [launchpad]
         services = mock.module:OpsSvc
         """,
@@ -201,7 +200,7 @@ def test_common_handlers_called(monkeypatch, tmp_path):
 
     ini = make_cfg(
         tmp_path,
-        f"""
+        """
         [launchpad]
         services = mock.module:OpsSvc
         common_registrator_opts = mock.module:reg

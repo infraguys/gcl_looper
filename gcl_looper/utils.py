@@ -50,9 +50,7 @@ def cfg_load_module_attr(attr_path: str) -> tp.Any:
     try:
         attr = getattr(module, attr_name)
     except AttributeError:
-        raise ValueError(
-            f"Attribute {attr_name} not found in module {module_path}"
-        )
+        raise ValueError(f"Attribute {attr_name} not found in module {module_path}")
 
     return attr
 
@@ -97,16 +95,12 @@ def downgrade_user_group_privileges(user="nobody") -> None:
     If running as root, permanently change the process user and group to the specified user.
     """
     if not sys.platform.startswith("linux"):
-        LOG.warning(
-            "downgrade_user_group_privileges: only supported on Linux."
-        )
+        LOG.warning("downgrade_user_group_privileges: only supported on Linux.")
         return
 
     current_uid = os.getuid()
     if current_uid != 0:
-        LOG.warning(
-            "downgrade_user_group_privileges: only root can downgrade."
-        )
+        LOG.warning("downgrade_user_group_privileges: only root can downgrade.")
         return
 
     try:

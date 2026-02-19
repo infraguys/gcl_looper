@@ -13,9 +13,10 @@ class TestLaunchpadServiceParseAndOpts:
             "MyService",
             2,
         )
-        assert launchpad.LaunchpadService._parse_svc_str(
-            "pkg.mod:MyService"
-        ) == ("pkg.mod:MyService", 1)
+        assert launchpad.LaunchpadService._parse_svc_str("pkg.mod:MyService") == (
+            "pkg.mod:MyService",
+            1,
+        )
 
     def test_parse_svc_str_invalid(self):
         with pytest.raises(ValueError):

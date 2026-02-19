@@ -44,7 +44,7 @@ class BjoernService(base.AbstractService):
             wsgi_app=self._wsgi_app,
             host=self._host,
             port=self._port,
-            **self._bjoern_kwargs
+            **self._bjoern_kwargs,
         )
         return super()._setup()
 

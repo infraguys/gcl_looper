@@ -1,0 +1,191 @@
+[project]
+name = "gcl_looper"
+description = "Looper is a daemonizer library, it can help you with lifecycle of your daemon."
+readme = "README.md"
+authors = [{name = "Genesis Corporation", email = "mail@gmelikov.ru"}]
+dynamic = ["version"]
+license = {text = "Apache-2.0"}
+requires-python = ">=3.8"
+classifiers = [
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+
+dependencies = [
+    "pbr>=1.10.0,<5.8.2",  # Apache-2.0
+    "oslo.config>=3.22.2,<10.0.0",  # Apache-2.0
+    "importlib-metadata>=6.8.0,<7.0.0",  # Apache-2.0
+    "setuptools>=75.3.0,<76.0.0",  # MIT License
+]
+
+[project.urls]
+homepage = "https://github.com/infraguys/gcl_looper/"
+
+[build-system]
+requires = [
+    "setuptools>=75.3.3",  # last version for python3.8
+    "setuptools_scm>=8"
+]
+build-backend = "setuptools.build_meta"
+
+[project.optional-dependencies]
+base = [
+    "pbr>=1.10.0,<5.8.2",  # Apache-2.0
+    "oslo.config>=3.22.2,<10.0.0",  # Apache-2.0
+    "importlib-metadata>=6.8.0,<7.0.0",  # Apache-2.0
+    "setuptools>=75.3.0,<76.0.0",  # MIT License
+]
+dev = [
+    "tox>=4.0.0",
+    "tox-uv",
+    "pytest>=7.0.0",
+]
+test = [
+    "coverage>=4.0",
+    "mock>=3.0.5,<4.0.0",
+    "pytest>=8.0.0,<9.0.0",
+    "pytest-xdist[psutil]>=3.6.1,<4.0.0",  # MIT License (MIT)
+    "pytest-timer>=1.0.0,<2.0.0",  # MIT License (MIT)
+    "requests>=2.32",
+    "bjoern>=3.2.2"  # BSD
+]
+mypy = [
+    "mypy",
+]
+ruff = [
+    "ruff",
+]
+shellcheck = [
+    "shellcheck-py",
+]
+
+[tool.ruff]
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pyenv",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "site-packages",
+    "venv",
+    "docs",
+]
+
+# Same as Black.
+line-length = 88
+indent-width = 4
+# Assume Python 3.8
+target-version = "py38"
+[lint]
+# Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`)  codes by default.
+select = ["E4", "E7", "E9", "F"]
+ignore = []
+# Allow fix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+unfixable = []
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+[format]
+# Like Black, use double quotes for strings.
+quote-style = "double"
+# Like Black, indent with spaces, rather than tabs.
+indent-style = "space"
+# Like Black, respect magic trailing commas.
+skip-magic-trailing-comma = false
+# Like Black, automatically detect the appropriate line ending.
+line-ending = "auto"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[project.scripts]
+gcl-looper-launchpad-service = "gcl_looper.cmd.launchpad:main"
+
+[tool.uv]
+package = true
+
+[tool.mypy]
+exclude = [
+    '.venv',
+    'gcl_looper/tests',
+]
+python_version = "3.12"
+disallow_untyped_defs = true
+show_error_codes = true
+no_implicit_optional = true
+warn_return_any = false
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+[tool.setuptools.package-data]
+gcl_looper = ["*.yaml", "*.md"]
+
+[tool.coverage.run]
+branch = true
+source = [
+    "gcl_looper"
+]
+command_line = "-m pytest -s gcl_looper/tests/unit"
+omit = [
+    "gcl_looper/tests/*",
+    ".venv",
+    "memory:0x"
+]
+
+[tool.coverage.report]
+# Regexes for lines to exclude from consideration
+exclude_also = [
+    # Don't complain about missing debug-only code:
+    "def __repr__",
+    "if self\\.debug",
+    "if settings\\.DEBUG",
+
+    # Don't complain if tests don't hit defensive assertion code:
+    "raise AssertionError",
+    "raise NotImplementedError",
+
+    # Don't complain if non-runnable code isn't run:
+    "if 0:",
+    "if __name__ == .__main__.:",
+
+    "if TYPE_CHECKING:",
+
+    # Don't complain about abstract methods, they aren't run:
+    "@(abc\\.)?abstractmethod",
+    ]
+
+ignore_errors = true
+
+[tool.coverage.html]
+directory = "cover"
+
+[tool.coverage.xml]
+output = "cover/coverage.xml"
