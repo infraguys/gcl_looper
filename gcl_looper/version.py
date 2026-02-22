@@ -15,6 +15,11 @@
 #    under the License.
 
 
-import pbr.version
+from importlib.metadata import version
 
-version_info = pbr.version.VersionInfo("gcl_looper")
+
+version_info = version("gcl_looper")
+
+
+if __name__ == "__main__":
+    print(version_info)

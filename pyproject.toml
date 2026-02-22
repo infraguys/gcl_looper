@@ -21,7 +21,6 @@ classifiers = [
 ]
 
 dependencies = [
-    "pbr>=1.10.0,<5.8.2",  # Apache-2.0
     "oslo.config>=3.22.2,<10.0.0",  # Apache-2.0
     "importlib-metadata>=6.8.0,<7.0.0",  # Apache-2.0
     "setuptools>=75.3.0,<76.0.0",  # MIT License
@@ -40,12 +39,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools_scm]
 
 [project.optional-dependencies]
-base = [
-    "pbr>=1.10.0,<5.8.2",  # Apache-2.0
-    "oslo.config>=3.22.2,<10.0.0",  # Apache-2.0
-    "importlib-metadata>=6.8.0,<7.0.0",  # Apache-2.0
-    "setuptools>=75.3.0,<76.0.0",  # MIT License
-]
 dev = [
     "tox>=4.0.0",
     "tox-uv",
