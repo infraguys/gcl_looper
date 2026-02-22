@@ -37,6 +37,8 @@ requires = [
 ]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools_scm]
+
 [project.optional-dependencies]
 base = [
     "pbr>=1.10.0,<5.8.2",  # Apache-2.0
