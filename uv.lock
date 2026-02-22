@@ -591,6 +591,13 @@ wheels = [
 [[package]]
 name = "gcl-looper"
 source = { editable = "." }
+dependencies = [
+    { name = "importlib-metadata" },
+    { name = "oslo-config", version = "9.6.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },
+    { name = "oslo-config", version = "9.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.9'" },
+    { name = "pbr" },
+    { name = "setuptools" },
+]
 
 [package.optional-dependencies]
 base = [
@@ -640,10 +647,13 @@ test = [
 requires-dist = [
     { name = "bjoern", marker = "extra == 'test'", specifier = ">=3.2.2" },
     { name = "coverage", marker = "extra == 'test'", specifier = ">=4.0" },
+    { name = "importlib-metadata", specifier = ">=6.8.0,<7.0.0" },
     { name = "importlib-metadata", marker = "extra == 'base'", specifier = ">=6.8.0,<7.0.0" },
     { name = "mock", marker = "extra == 'test'", specifier = ">=3.0.5,<4.0.0" },
     { name = "mypy", marker = "extra == 'mypy'" },
+    { name = "oslo-config", specifier = ">=3.22.2,<10.0.0" },
     { name = "oslo-config", marker = "extra == 'base'", specifier = ">=3.22.2,<10.0.0" },
+    { name = "pbr", specifier = ">=1.10.0,<5.8.2" },
     { name = "pbr", marker = "extra == 'base'", specifier = ">=1.10.0,<5.8.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0.0,<9.0.0" },
@@ -651,6 +661,7 @@ requires-dist = [
     { name = "pytest-xdist", extras = ["psutil"], marker = "extra == 'test'", specifier = ">=3.6.1,<4.0.0" },
     { name = "requests", marker = "extra == 'test'", specifier = ">=2.32" },
     { name = "ruff", marker = "extra == 'ruff'" },
+    { name = "setuptools", specifier = ">=75.3.0,<76.0.0" },
     { name = "setuptools", marker = "extra == 'base'", specifier = ">=75.3.0,<76.0.0" },
     { name = "shellcheck-py", marker = "extra == 'shellcheck'" },
     { name = "tox", marker = "extra == 'dev'", specifier = ">=4.0.0" },
