@@ -67,8 +67,9 @@ class ProcessHubService(BasicHubService):
         for instance in self._instances.values():
             if not instance.is_alive():
                 LOG.error(
-                    "Child service(pid:%i) is not running, let's stop",
+                    "Child service(pid:%i) is not running, exit code %r, let's stop",
                     instance.pid,
+                    instance.exitcode,
                 )
                 self.stop()
                 return
@@ -100,6 +101,16 @@ class ThreadHubService(ProcessHubService):
 
     def add_service(self, service):
         super(ProcessHubService, self).add_service(service)
+
+    def _iteration(self):
+        for instance in self._instances.values():
+            if not instance.is_alive():
+                LOG.error(
+                    "Child service(tid:%i) is not running, let's stop",
+                    instance.native_id,
+                )
+                self.stop()
+                return
 
     def _setup(self):
         # Threads can't hangle signals so we need to disable them
