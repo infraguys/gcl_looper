@@ -14,6 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import threading
 from unittest import mock
 
 from gcl_looper.services import basic
@@ -82,32 +83,50 @@ class TestBasicService:
         assert self.service._iteration_number == 3
         assert not self.service._enabled
 
-    @mock.patch("time.sleep", return_value=None)
-    def test_iter_pause(self, time_sleep):
+    def test_iter_pause(self):
         self.service = TestFiniteService(iter_pause=1)
+        mock_wait = mock.MagicMock(return_value=False)
+        self.service._stop_event.wait = mock_wait
 
         self.service.start()
 
-        calls = [mock.call(1)] * 3
-        time_sleep.assert_has_calls(calls)
-        assert time_sleep.call_count == 3
-        sleep_values = [call[0][0] for call in time_sleep.call_args_list]
-        assert all(0.5 < value < 1.1 for value in sleep_values)
+        assert mock_wait.call_count == 3
+        wait_values = [c.kwargs["timeout"] for c in mock_wait.call_args_list]
+        assert all(0.5 < value < 1.1 for value in wait_values)
 
-    @mock.patch("time.sleep", return_value=None)
-    def test_iter_pause_zero_wo_slept(self, time_sleep):
+    def test_iter_pause_zero_wo_slept(self):
         self.service = TestFiniteService(iter_pause=0)
+        mock_wait = mock.MagicMock(return_value=False)
+        self.service._stop_event.wait = mock_wait
 
         self.service.start()
 
-        time_sleep.assert_not_called()
+        mock_wait.assert_not_called()
 
-    @mock.patch("time.sleep", return_value=None)
-    def test_iter_min_period(self, time_sleep):
+    def test_iter_min_period(self):
         self.service = TestFiniteService(iter_min_period=0.001, iter_pause=0)
+        mock_wait = mock.MagicMock(return_value=False)
+        self.service._stop_event.wait = mock_wait
 
         self.service.start()
 
-        # We mock time.sleep, so it won't wait and we'll have many of requests
-        time_sleep.assert_called()
-        assert 0 < time_sleep.call_args[0][0] < 0.001
+        # We mock Event.wait, so it won't wait and we'll have many of requests
+        mock_wait.assert_called()
+        assert 0 < mock_wait.call_args.kwargs["timeout"] < 0.001
+
+    def test_stop_interrupts_sleep(self):
+        # Service with a long sleep period — stop() must wake it up
+        service = TestService(iter_min_period=0, iter_pause=60)
+        loop_thread = threading.Thread(target=service._loop)
+        loop_thread.start()
+
+        # Give the loop time to enter the sleep phase
+        loop_thread.join(timeout=0.1)
+
+        service.stop()
+        loop_thread.join(timeout=1)
+
+        assert not service._enabled
+        assert not loop_thread.is_alive(), (
+            "stop() did not interrupt sleep — loop thread still running"
+        )

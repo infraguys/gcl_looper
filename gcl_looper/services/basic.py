@@ -16,6 +16,7 @@
 
 import abc
 import logging
+import threading
 import time
 
 from gcl_looper.services import base
@@ -29,6 +30,7 @@ class BasicService(base.AbstractService):
     def __init__(self, iter_min_period=1, iter_pause=0.1):
         super(BasicService, self).__init__()
         self._enabled = False
+        self._stop_event = threading.Event()
         self._iter_min_period = iter_min_period
         self._iter_pause = iter_pause
         self._iteration_number = 0
@@ -60,6 +62,7 @@ class BasicService(base.AbstractService):
 
     def _loop(self):
         self._enabled = True
+        self._stop_event.clear()
         next_iteration_time = 0
         while self._enabled:
             current_time = time.monotonic()
@@ -70,7 +73,9 @@ class BasicService(base.AbstractService):
 
             time_to_sleep = next_iteration_time - time.monotonic()
             if time_to_sleep > 0 or self._iter_pause > 0:
-                time.sleep(max(time_to_sleep, self._iter_pause))
+                self._stop_event.wait(
+                    timeout=max(time_to_sleep, self._iter_pause),
+                )
 
     @abc.abstractmethod
     def _iteration(self):
@@ -80,3 +85,4 @@ class BasicService(base.AbstractService):
     def stop(self):
         LOG.info("Stop service")
         self._enabled = False
+        self._stop_event.set()

@@ -1,6 +1,7 @@
 import multiprocessing
 import os
 import signal
+import threading
 import time
 
 import pytest
@@ -86,6 +87,42 @@ def test_mp_service_died(prepared_service):
     # Check that service's stop() method wasn't called
     assert prepared_service._value.value != -1
     assert not h._enabled
+
+
+def test_mp_stop_by_signal(prepared_service):
+    h = hub.ProcessHubService()
+    h.should_subscribe_signals = False
+    h.add_service(prepared_service)
+
+    # Subscribe signal handler in main thread manually
+    original_handler = signal.signal(
+        signal.SIGTERM,
+        lambda s, f: h.stop(),
+    )
+
+    hub_thread = threading.Thread(target=h.start)
+    hub_thread.start()
+
+    try:
+        # Allow some iterations to run
+        time.sleep(0.3)
+        instance = h._instances[prepared_service]
+
+        assert instance.is_alive()
+        assert prepared_service._value.value >= 2
+
+        # Send SIGTERM to the hub process (current process)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+        # Hub should stop quickly (not wait for full sleep period)
+        hub_thread.join(timeout=0.3)
+
+        assert not hub_thread.is_alive(), "Hub did not stop after SIGTERM"
+        assert not h._enabled
+        assert not instance.is_alive(), "Service did not stop after SIGTERM"
+        assert prepared_service._value.value == -1
+    finally:
+        signal.signal(signal.SIGTERM, original_handler)
 
 
 def test_mt_start_stop_services(prepared_service):

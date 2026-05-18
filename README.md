@@ -166,7 +166,7 @@ Launchpad service is a service that can run multiple services and execute them s
 **Basic usage:**
 
 ```python
-from gcl_looper.services import launchpad
+from gcl_looper.services.oslo import launchpad
 
 services = [
     MyService(),

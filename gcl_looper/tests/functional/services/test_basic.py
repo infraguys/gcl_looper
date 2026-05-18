@@ -15,6 +15,8 @@
 #    under the License.
 
 import multiprocessing
+import os
+import signal
 import time
 import logging
 
@@ -55,7 +57,7 @@ def test_basic_service_iterations_and_stop():
 
     assert value.value in [2, 3]
 
-    process.terminate()
+    os.kill(process.pid, signal.SIGTERM)
     process.join(timeout=2)
 
     assert not process.is_alive(), "Service did not stop gracefully"
