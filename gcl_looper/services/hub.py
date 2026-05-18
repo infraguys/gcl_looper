@@ -50,9 +50,6 @@ class BasicHubService(basic.BasicService):
     def _stop_instance(self, service, instance):
         raise NotImplementedError()
 
-    def stop(self):
-        raise NotImplementedError()
-
 
 class ProcessHubService(BasicHubService):
     _instance_class = multiprocessing.get_context("fork").Process
@@ -90,8 +87,7 @@ class ProcessHubService(BasicHubService):
             LOG.exception("Failed to terminate child service, pid:%i", instance.pid)
 
     def stop(self):
-        LOG.info("Stop service")
-        self._enabled = False
+        super().stop()
         # Stop all managed services
         for service, instance in self._instances.items():
             self._stop_instance(service, instance)
