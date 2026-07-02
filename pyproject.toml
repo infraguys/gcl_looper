@@ -51,7 +51,7 @@ test = [
     "pytest-xdist[psutil]>=3.6.1,<4.0.0",  # MIT License (MIT)
     "pytest-timer>=1.0.0,<2.0.0",  # MIT License (MIT)
     "requests>=2.32",
-    "bjoern>=3.2.2"  # BSD
+    "bjoern-binary>=3.2.2"  # BSD
 ]
 mypy = [
     "mypy",
