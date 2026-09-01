@@ -15,6 +15,7 @@
 #    under the License.
 
 import threading
+import time
 from unittest import mock
 
 from gcl_looper.services import basic
@@ -86,18 +87,21 @@ class TestBasicService:
     def test_iter_pause(self):
         self.service = TestFiniteService(iter_pause=1)
         mock_wait = mock.MagicMock(return_value=False)
-        self.service._stop_event.wait = mock_wait
+        self.service._wake_event.wait = mock_wait
 
         self.service.start()
 
-        assert mock_wait.call_count == 3
+        # Two wait() calls — after iterations 1 and 2. Iteration 3
+        # calls stop() from inside _iteration(), and the loop exits
+        # immediately via the _enabled check, without an extra sleep.
+        assert mock_wait.call_count == 2
         wait_values = [c.kwargs["timeout"] for c in mock_wait.call_args_list]
         assert all(0.5 < value < 1.1 for value in wait_values)
 
     def test_iter_pause_zero_wo_slept(self):
         self.service = TestFiniteService(iter_pause=0)
         mock_wait = mock.MagicMock(return_value=False)
-        self.service._stop_event.wait = mock_wait
+        self.service._wake_event.wait = mock_wait
 
         self.service.start()
 
@@ -106,7 +110,7 @@ class TestBasicService:
     def test_iter_min_period(self):
         self.service = TestFiniteService(iter_min_period=0.001, iter_pause=0)
         mock_wait = mock.MagicMock(return_value=False)
-        self.service._stop_event.wait = mock_wait
+        self.service._wake_event.wait = mock_wait
 
         self.service.start()
 
@@ -129,4 +133,31 @@ class TestBasicService:
         assert not service._enabled
         assert not loop_thread.is_alive(), (
             "stop() did not interrupt sleep — loop thread still running"
+        )
+
+    def test_stop_from_iteration_exits_fast(self):
+        # stop() called from inside _iteration() must not delay the
+        # exit by a full iter_min_period. The loop checks _enabled
+        # right after _loop_iteration() and breaks immediately.
+        class StopOnFirstIteration(basic.BasicService):
+            __test__ = False
+
+            def _iteration(self):
+                self.stop()
+
+        service = StopOnFirstIteration(iter_min_period=5, iter_pause=0)
+        start_time = time.monotonic()
+        loop_thread = threading.Thread(target=service._loop)
+        loop_thread.start()
+        loop_thread.join(timeout=2)
+        elapsed = time.monotonic() - start_time
+
+        assert not service._enabled
+        assert not loop_thread.is_alive(), (
+            "stop() from _iteration() delayed exit by a full "
+            "iter_min_period — loop thread still running after 2s"
+        )
+        assert elapsed < 1.0, (
+            "stop() from _iteration() took %.2fs to exit — "
+            "expected under 1s" % elapsed
         )

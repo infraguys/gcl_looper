@@ -56,8 +56,10 @@ def test_mp_start_stop_services(prepared_service):
 
     h.start()
 
-    # Allow some iterations to run
-    time.sleep(0.2)
+    # Allow some iterations to run. The hub exits immediately after
+    # its single iteration (OneTimeProcessHub sets _enabled = False),
+    # so the child process's entire run time comes from this sleep.
+    time.sleep(0.5)
     instance = h._instances[prepared_service]
 
     assert instance.is_alive()
@@ -65,9 +67,19 @@ def test_mp_start_stop_services(prepared_service):
     assert prepared_service._value.value > 2
 
     h.stop()
+    # The child process receives SIGTERM from h.stop() and sets
+    # _value to -1 in its signal handler. h.stop() already calls
+    # instance.join(), but the child may not have written the value
+    # to shared memory by the time join() returns. Poll until the
+    # value is visible.
+    deadline = time.monotonic() + 5
+    while prepared_service._value.value != -1 and time.monotonic() < deadline:
+        instance.join(timeout=0.1)
 
     assert not instance.is_alive(), "Service did not stop gracefully"
-    assert prepared_service._value.value == -1
+    assert prepared_service._value.value == -1, (
+        "Service stop() did not set value to -1"
+    )
 
 
 def test_mp_service_died(prepared_service):
@@ -78,6 +90,10 @@ def test_mp_service_died(prepared_service):
     instance = h._instances[prepared_service]
 
     os.kill(instance.pid, signal.SIGKILL)
+    # Wait for the OS to reap the killed process so that
+    # instance.is_alive() reflects the real state by the time the
+    # hub's _iteration checks it.
+    instance.join()
 
     # Continue hub's loop to check if it handles the service death
     h._enabled = True
@@ -132,8 +148,10 @@ def test_mt_start_stop_services(prepared_service):
     h.start()
     instance = h._instances[prepared_service]
 
-    # Allow some iterations to run
-    time.sleep(0.2)
+    # Allow some iterations to run. The hub exits immediately after
+    # its single iteration (OneTimeThreadHub sets _enabled = False),
+    # so the child thread's entire run time comes from this sleep.
+    time.sleep(0.5)
     assert instance.is_alive()
 
     assert prepared_service._value.value > 2
