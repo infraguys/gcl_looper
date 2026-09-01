@@ -220,3 +220,93 @@ def test_common_handlers_called(monkeypatch, tmp_path):
     )
 
     assert calls == {"reg": 1, "init": 1}
+
+
+def test_boost_protection_from_config(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "gcl_looper.utils.cfg_load_module_attr",
+        lambda path: OpsSvc,
+    )
+
+    ini = make_cfg(
+        tmp_path,
+        """
+        [launchpad]
+        services = mock.module:OpsSvc
+        boost_max_iterations = 100
+        boost_cooldown_iterations = 200
+
+        [mock.module:OpsSvc]
+        param = abc
+        num = 1
+        """,
+    )
+
+    svc = launchpad.LaunchpadService.from_cmd_line(
+        [
+            "--config-file",
+            ini,
+        ]
+    )
+
+    assert svc._max_boost_iterations == 100
+    assert svc._boost_cooldown_iterations == 200
+
+
+def test_boost_protection_disabled_by_default(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "gcl_looper.utils.cfg_load_module_attr",
+        lambda path: OpsSvc,
+    )
+
+    ini = make_cfg(
+        tmp_path,
+        """
+        [launchpad]
+        services = mock.module:OpsSvc
+
+        [mock.module:OpsSvc]
+        param = abc
+        num = 1
+        """,
+    )
+
+    svc = launchpad.LaunchpadService.from_cmd_line(
+        [
+            "--config-file",
+            ini,
+        ]
+    )
+
+    assert svc._max_boost_iterations is None
+    assert svc._boost_cooldown_iterations is None
+    assert not svc.is_cooling_down
+
+
+def test_boost_protection_validation_from_config(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "gcl_looper.utils.cfg_load_module_attr",
+        lambda path: OpsSvc,
+    )
+
+    # Only one of the two options set — configure_boost_protection raises
+    ini = make_cfg(
+        tmp_path,
+        """
+        [launchpad]
+        services = mock.module:OpsSvc
+        boost_max_iterations = 100
+
+        [mock.module:OpsSvc]
+        param = abc
+        num = 1
+        """,
+    )
+
+    with pytest.raises(ValueError):
+        launchpad.LaunchpadService.from_cmd_line(
+            [
+                "--config-file",
+                ini,
+            ]
+        )

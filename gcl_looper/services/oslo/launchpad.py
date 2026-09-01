@@ -60,6 +60,9 @@ class LaunchpadService(basic.BasicService, oslo_base.OsloConfigurableService):
     ):
         super().__init__(iter_min_period, iter_pause)
         self._services = services
+        for service in self._services:
+            if isinstance(service, basic.BoostableServiceMixin):
+                service.set_boost_parent(self)
 
     def _setup(self):
         LOG.info("Setup all services")
@@ -173,6 +176,26 @@ class LaunchpadService(basic.BasicService, oslo_base.OsloConfigurableService):
                 default=0.1,
                 help="Pause between iterations",
             ),
+            cfg.IntOpt(
+                "boost_max_iterations",
+                default=None,
+                help=(
+                    "Maximum number of consecutive boosted iterations "
+                    "before the launchpad overheats and the boost is "
+                    "dropped. Requires ``boost_cooldown_iterations`` to "
+                    "be set. None (default) disables the overheat "
+                    "protection."
+                ),
+            ),
+            cfg.IntOpt(
+                "boost_cooldown_iterations",
+                default=None,
+                help=(
+                    "Number of forced default-pace iterations after the "
+                    "launchpad overheats, during which boost requests are "
+                    "refused. Requires ``boost_max_iterations`` to be set."
+                ),
+            ),
         ]
 
     @classmethod
@@ -261,8 +284,27 @@ class LaunchpadService(basic.BasicService, oslo_base.OsloConfigurableService):
             LOG.info("Service %s loaded, %d instance(s)", svc_name, count)
 
         # Create global service
-        return cls(
+        launchpad_service = cls(
             services=services,
             iter_min_period=launchpad_cfg[DOMAIN].iter_min_period,
             iter_pause=launchpad_cfg[DOMAIN].iter_pause,
         )
+
+        # Configure boost overheat protection if any of the options is set.
+        # configure_boost_protection validates that both are set together
+        # (or both are None to disable).
+        boost_max = launchpad_cfg[DOMAIN].boost_max_iterations
+        boost_cooldown = launchpad_cfg[DOMAIN].boost_cooldown_iterations
+        if boost_max is not None or boost_cooldown is not None:
+            launchpad_service.configure_boost_protection(
+                max_boost_iterations=boost_max,
+                cooldown_iterations=boost_cooldown,
+            )
+            LOG.info(
+                "Boost overheat protection configured for launchpad: "
+                "max_boost_iterations=%s, cooldown_iterations=%s",
+                boost_max,
+                boost_cooldown,
+            )
+
+        return launchpad_service

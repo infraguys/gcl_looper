@@ -107,14 +107,92 @@ if __name__ == "__main__":
 
 **Public interface:**
 -----------------------------
+
 * **`start()`**: Starts the service.
 * **`stop()`**: Stop the service.
 * **`_loop_iteration()`**: Performs one iteration of the service loop.
+* **Boost mode**: `boost()`, `reset_boost()` — see the Boost mode section
+  below.
 
 **Implement these methods to get usable service:**
 ---------------------------
 
 * **`_iteration()`**: This method must be implemented by subclasses to perform the actual work at each iteration.
+
+### Boost mode (dynamic iteration pace)
+
+By default the iteration pace (`iter_min_period`/`iter_pause`) is static.
+The boost mode allows the business logic to change the pace dynamically,
+for instance, to react on events faster for a while and then return to the
+default pace:
+
+```python
+service = MyService(iter_min_period=3, iter_pause=0.1)
+
+# Run the next 5 iterations as fast as possible (the default)
+service.boost()
+
+# Or iterate each 0.5 second for 5 iterations
+service.boost(0.5)
+
+# Or boost until explicitly reset (pass iterations=None)
+service.boost(0.5, iterations=None)
+
+# Or boost only the next 10 iterations
+service.boost(0.5, iterations=10)
+
+# Reapply the boost and wake the loop even if the pacing is unchanged
+service.boost(0.5, force=True)
+
+# Return to the default pace
+service.reset_boost()
+```
+
+**Boost interface:**
+
+* **`boost(iter_min_period=0, iter_pause=0, iterations=5, force=False)`**:
+  Switch the service into boost mode. With no arguments, the next 5
+  iterations run without a minimum period or pause. A repeated call replaces
+  the previous boost; `force=True` also wakes the loop when the pacing is
+  unchanged. `iterations=None` means the boost never expires by itself, but
+  is only allowed when at least one of `iter_min_period` or `iter_pause` is
+  greater than zero — otherwise the loop would spin without any delay.
+  Returns `False` if the boost is refused during the overheat cooldown (own
+  or an ancestor's).
+* **`reset_boost()`**: Return to the default iteration pace.
+* **`is_boosted`**, **`boost_remaining_iterations`**,
+  **`effective_iter_min_period`**, **`effective_iter_pause`**: Inspect the
+  current pace.
+
+A buggy business logic can enable the boost on every iteration and keep
+the service in the boost mode forever, starving the other services which
+share its loop. The overheat protection limits that:
+
+```python
+# No more than 100 boosted iterations in a row, then force 200
+# iterations in the default pace during which boost is refused
+service.configure_boost_protection(
+    max_boost_iterations=100,
+    cooldown_iterations=200,
+)
+```
+
+The counter of consecutive boosted iterations is reset as soon as the
+service performs an iteration in the default pace. When the service
+overheats, the boost is dropped and `boost()` returns `False` and has no
+effect until the cooldown iterations are done.
+
+* **`configure_boost_protection(max_boost_iterations, cooldown_iterations)`**:
+  Configure the protection (`None, None` disables it).
+* **`is_cooling_down`**, **`boost_cooldown_remaining`**,
+  **`boost_overheat_count`**: Inspect the cooldown state.
+
+Boost mode works inside the `LaunchpadService` as well: since the inner
+services are iterated by the launchpad itself, boosting any of the inner
+services boosts the whole launchpad and, thus, all of its services. The
+launchpad uses the minimum iteration period between its own pace and the
+pace of all boosted inner services. A boost is applied to the launchpad
+until all inner boosts are reset or expired.
 
 ### Process Hub service
 
@@ -186,7 +264,6 @@ The most important part in the launchpad service is its configuration. In the co
 * **`common_initializer`**: Common initializer for all services. This initializer is called after the service is created and before it is started.
 * **`iter_min_period`**: Minimum period between iterations of the service loop.
 * **`iter_pause`**: Pause between iterations of the service loop.
-
 
 **Example:**
 
