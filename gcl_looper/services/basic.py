@@ -21,6 +21,7 @@ import time
 import typing
 
 from gcl_looper.services import base
+from gcl_looper.watchdogs import exceptions as wd_exc
 
 LOG = logging.getLogger(__name__)
 
@@ -416,13 +417,25 @@ class BoostableServiceMixin:
 class BasicService(BoostableServiceMixin, base.AbstractService):
     __log_iteration__ = True
 
-    def __init__(self, iter_min_period=1, iter_pause=0.1):
-        super(BasicService, self).__init__()
+    def __init__(self, iter_min_period=1, iter_pause=0.1, watchdog=None):
+        super(BasicService, self).__init__(watchdog=watchdog)
         self._enabled = False
         self._stop_event = threading.Event()
         self._iter_min_period = iter_min_period
         self._iter_pause = iter_pause
         self._iteration_number = 0
+        self._is_master = False
+
+    @property
+    def is_master(self) -> bool:
+        """Whether the service is allowed to do its work now.
+
+        ``True`` when the service has no watchdog (it always acts as the
+        master) or when the watchdog currently holds the master lock.
+        """
+        if self._watchdog is None:
+            return True
+        return self._is_master
 
     def _loop_iteration(self):
         iteration = self._iteration_number
@@ -433,7 +446,7 @@ class BasicService(BoostableServiceMixin, base.AbstractService):
                 self.__class__.__name__,
             )
         try:
-            self._iteration()
+            self._guarded_iteration(iteration)
             if self.__log_iteration__:
                 LOG.debug(
                     "Iteration #%d finished for %s",
@@ -449,6 +462,127 @@ class BasicService(BoostableServiceMixin, base.AbstractService):
         finally:
             self._iteration_number += 1
             self._consume_boost_iteration()
+
+    def _guarded_iteration(self, iteration: int) -> None:
+        """Call ``_iteration()`` guarded by the watchdog (if any).
+
+        When the watchdog does not own the master lock (another node is the
+        master), the watchdog raises a minor exception and the iteration is
+        silently skipped: this is how standby instances wait on their nodes
+        without doing any work until they take over.
+        """
+        watchdog = self._watchdog
+        if watchdog is None:
+            self._iteration()
+            return
+
+        become_failed = False
+        try:
+            with watchdog:
+                if not self._update_master_state():
+                    # The become-master hook failed: do not run the
+                    # iteration. The state was reset so the hook will be
+                    # retried on the next iteration.
+                    become_failed = True
+                    return
+                self._iteration()
+        except wd_exc.WatchDogMinorException as e:
+            # Not the master anymore (or not yet): skip this iteration.
+            LOG.debug(
+                "Skipping iteration #%d for %s: %s",
+                iteration,
+                self.__class__.__name__,
+                e,
+            )
+        finally:
+            # Synchronize the master state and fire the hooks on every
+            # transition, including the transitions caused by exceptions
+            # (e.g. a lost database connection demotes the node). Skip
+            # the sync when the become hook failed: the state was already
+            # rolled back and re-syncing would re-trigger the failing hook.
+            if not become_failed:
+                self._update_master_state()
+
+    def _update_master_state(self) -> bool:
+        """Detect master state transitions and notify the service.
+
+        Returns ``False`` when the become-master hook failed (the service
+        should skip the current iteration); ``True`` otherwise.
+        """
+        watchdog = self._watchdog
+        if watchdog is None:
+            return True
+
+        is_master = bool(watchdog.is_master)
+        if is_master == self._is_master:
+            return True
+        self._is_master = is_master
+
+        if is_master:
+            LOG.info("%s has acquired the master lock", self.__class__.__name__)
+            try:
+                self._on_become_master()
+            except Exception:
+                LOG.exception(
+                    "Unexpected error in _on_become_master() of %s",
+                    self.__class__.__name__,
+                )
+                # Roll back the transition so the hook is retried on the
+                # next iteration instead of running work without the
+                # resources the hook was supposed to set up.
+                self._is_master = False
+                return False
+        else:
+            LOG.info("%s has lost the master lock", self.__class__.__name__)
+            try:
+                self._on_lose_master()
+            except Exception:
+                LOG.exception(
+                    "Unexpected error in _on_lose_master() of %s",
+                    self.__class__.__name__,
+                )
+        return True
+
+    def _on_become_master(self) -> None:
+        """Hook called when the service acquires the master lock.
+
+        Create/reload the resources that must exist only while the service
+        is the master (DB engines, consumers, schedulers, ...). Exceptions
+        here are logged and do not break the loop.
+        """
+
+    def _on_lose_master(self) -> None:
+        """Hook called when the service loses the master lock.
+
+        Release the master-only resources; the service will try to take the
+        leadership again on the next iterations.
+        """
+
+    def _release_master(self) -> None:
+        """Demote the service if it is currently the master.
+
+        Calls :meth:`_on_lose_master` exactly once and resets the master
+        flag. Used during shutdown so master-only resources are cleaned up
+        before the lock is released.
+        """
+        if not self._is_master:
+            return
+        LOG.info("%s releasing the master lock on shutdown", self.__class__.__name__)
+        try:
+            self._on_lose_master()
+        except Exception:
+            LOG.exception(
+                "Unexpected error in _on_lose_master() of %s",
+                self.__class__.__name__,
+            )
+        finally:
+            self._is_master = False
+
+    def _finish(self) -> None:
+        # Demote before the watchdog releases the lock so master-only
+        # resources are cleaned up while we still hold the leadership.
+        self._release_master()
+        super()._finish()
 
     def _loop(self):
         self._enabled = True

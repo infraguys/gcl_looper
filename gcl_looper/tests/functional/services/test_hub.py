@@ -77,9 +77,7 @@ def test_mp_start_stop_services(prepared_service):
         instance.join(timeout=0.1)
 
     assert not instance.is_alive(), "Service did not stop gracefully"
-    assert prepared_service._value.value == -1, (
-        "Service stop() did not set value to -1"
-    )
+    assert prepared_service._value.value == -1, "Service stop() did not set value to -1"
 
 
 def test_mp_service_died(prepared_service):
