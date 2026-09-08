@@ -315,3 +315,144 @@ project_id = 123
 name = bar1
 project_id = 456
 ```
+
+### Master election (watchdogs)
+
+When the same daemon runs on several nodes, you usually want only **one**
+instance (the *master*) to do the real work while the others stay on standby.
+GCL Looper implements this with database-backed watchdogs: every service
+iteration tries to acquire a distributed lock; only the node that owns the
+lock runs the iteration, the others silently skip it until they take over.
+
+This is a port of the MySQL `GET_LOCK`/table-lock watchdogs from the original
+`rooster`/`node-manager` stack, rebuilt around a driver abstraction. Only
+PostgreSQL ships today, but the interface is database-agnostic and a new
+backend (e.g. MySQL) is added by implementing one small driver class and
+registering it.
+
+**Install the PostgreSQL extra:**
+
+```bash
+pip install gcl_looper[pg]   # brings in psycopg (v3)
+```
+
+#### Two PostgreSQL lock backends
+
+* `postgres_advisory` — session-level advisory locks (`pg_try_advisory_lock`).
+  A direct port of MySQL `GET_LOCK`: non-blocking acquire and **instant
+  failover** (the lock dies the moment the session/connection drops). The
+  watchdog keeps its **own dedicated connection** and never shares the
+  application pool (restalchemy/psycopg_pool keep working as usual).
+* `postgres_table` — a lock row in a table with an atomic `UPDATE`. Portable
+  across databases and works through a normal connection. A dead master is
+  taken over after `lock_timeout` seconds (the original node-manager used this
+  style).
+
+#### Programmatic usage
+
+```python
+from gcl_looper.services import basic
+from gcl_looper.watchdogs.locks.pg_table import PostgresTableLockDriver
+from gcl_looper.watchdogs.database import DbWatchDog
+
+watchdog = DbWatchDog(
+    PostgresTableLockDriver(
+        connection_url="postgresql://user:pass@db:5432/mydb",
+        lock_key="my_master_service",
+        lock_timeout=30,
+    ),
+)
+
+
+class MyMasterService(basic.BasicService):
+    def _iteration(self):
+        # Runs only on the node that currently holds the lock.
+        print("I am the master now")
+
+    # Optional hooks, fired on every leadership transition:
+    def _on_become_master(self):
+        ...  # create master-only resources
+
+    def _on_lose_master(self):
+        ...  # release them
+
+# Every iteration is guarded: when another node is the master the iteration
+# is skipped. Only one node is the master at a time.
+MyMasterService(watchdog=watchdog).start()
+```
+
+A service without a watchdog is always the master (unchanged behavior). The
+lock is released automatically in `stop()`/teardown so a standby takes over
+immediately (table locks also expire by themselves after `lock_timeout`).
+
+#### Launchpad / oslo configuration
+
+The whole launchpad (or any single service) can be guarded through config.
+Add the watchdog options to the `[launchpad]` section (they use the
+`watchdog_` prefix):
+
+```ini
+[launchpad]
+services =
+    my_package.service_foo:FooService
+# Master election for the whole launchpad:
+watchdog_lock_type = postgres_advisory
+watchdog_connection_url = postgresql://user:pass@db:5432/mydb
+watchdog_lock_key = my_daemon_master
+# Table-based locks only:
+watchdog_lock_timeout = 30
+watchdog_table_name = gcl_looper_locks
+```
+
+When `watchdog_lock_type` is set, the launchpad runs its inner services only
+while it owns the lock; standby launchpads stay idle. `watchdog_lock_type`
+accepts `none` (default), `dummy`, `timed`, or a registered lock driver
+(`postgres_advisory`, `postgres_table`, ...).
+
+To guard an individual service instead of the whole launchpad, register the
+same options (with any prefix) in the service's `svc_get_config_opts` and
+build the watchdog in its constructor:
+
+```python
+from gcl_looper.watchdogs import config as watchdogs_config
+
+
+class MyMasterService(basic.BasicService):
+    @classmethod
+    def svc_get_config_opts(cls):
+        return [
+            # ... own options ...
+            *watchdogs_config.get_config_opts(),
+        ]
+
+    def __init__(self, name, **kwargs):
+        watchdog, kwargs = watchdogs_config.build_watchdog_from_kwargs(
+            default_lock_key=f"{name}_lock", **kwargs
+        )
+        super().__init__(watchdog=watchdog, **kwargs)
+```
+
+#### Adding a new database (e.g. MySQL)
+
+1. Subclass `gcl_looper.watchdogs.locks.base.BaseLockDriver` (for a table
+   lock it is usually enough to subclass
+   `gcl_looper.watchdogs.locks.table.TableLockDriver` and override the
+   connection and SQL-flavor hooks), or
+2. register it by name and select it via `watchdog_lock_type`:
+
+```python
+from gcl_looper.watchdogs.locks import register_driver
+
+register_driver("mysql", "my_package.locks:MySQLTableLockDriver")
+```
+
+#### Running the functional tests
+
+The PostgreSQL functional tests are skipped unless a server is provided:
+
+```bash
+podman run -d --name gcl_looper_pg -e POSTGRES_PASSWORD=*** \
+    -e POSTGRES_DB=gcltest -p 5433:5432 docker.io/library/postgres:18
+GCL_LOOPER_TEST_PG_URL=postgresql://postgres:test@127.0.0.1:5433/gcltest \
+    pytest gcl_looper/tests/functional/watchdogs
+```

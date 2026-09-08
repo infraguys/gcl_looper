@@ -39,6 +39,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools_scm]
 
 [project.optional-dependencies]
+pg = [
+    # Master election watchdogs on PostgreSQL (>= 10, tested with 18).
+    # Same client library restalchemy uses for its PostgreSQL engine.
+    "psycopg>=3.1,<4",  # LGPL-3.0
+]
 dev = [
     "tox>=4.0.0",
     "tox-uv",
@@ -52,6 +57,11 @@ test = [
     "pytest-timer>=1.0.0,<2.0.0",  # MIT License (MIT)
     "requests>=2.32",
     "bjoern-binary>=3.2.2"  # BSD
+]
+functional = [
+    # PostgreSQL functional tests (requires a reachable PostgreSQL server,
+    # see `GCL_LOOPER_TEST_PG_URL`).
+    "psycopg[binary]>=3.1,<4",  # LGPL-3.0
 ]
 mypy = [
     "mypy",

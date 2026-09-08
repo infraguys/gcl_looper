@@ -17,6 +17,10 @@
 import abc
 import logging
 import signal
+import typing as tp
+
+if tp.TYPE_CHECKING:
+    from gcl_looper.watchdogs import base as wd_base
 
 LOG = logging.getLogger(__name__)
 
@@ -24,11 +28,19 @@ LOG = logging.getLogger(__name__)
 class AbstractService(abc.ABC):
     __mp_downgrade_user__ = None
 
-    def __init__(self):
+    def __init__(self, watchdog=None):
+        """
+        Args:
+            watchdog: Optional watchdog guarding the service iterations,
+                e.g. a ``gcl_looper.watchdogs`` master election watchdog.
+                When it does not own the lock, the iterations are skipped;
+                the lock is released automatically on ``_finish()``.
+        """
         super(AbstractService, self).__init__()
         self._setups = []
         self._finishes = []
         self._should_subscribe_signals = True
+        self._watchdog = watchdog
 
     @property
     def should_subscribe_signals(self):
@@ -72,11 +84,21 @@ class AbstractService(abc.ABC):
     def add_finishes(self, finish_func):
         self._finishes.append(finish_func)
 
+    def get_watchdog(self) -> "tp.Optional[wd_base.WatchDogBase]":
+        """Return the watchdog guarding this service (may be ``None``)."""
+        return self._watchdog
+
     def _finish(self):
         LOG.info("Finish loop")
         for finish_func in self._finishes:
             finish_func()
-        pass
+        # Release the master lock (if any) so a standby node can take over
+        # immediately instead of waiting for the lock to expire.
+        if self._watchdog is not None:
+            try:
+                self._watchdog.teardown()
+            except Exception:
+                LOG.exception("Failed to teardown the watchdog")
 
     def _get_sig_handlers(self):
         def stop_callback(s, frame):

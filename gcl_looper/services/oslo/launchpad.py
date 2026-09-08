@@ -26,6 +26,10 @@ from gcl_looper import version
 from gcl_looper import constants as c
 from gcl_looper.services import basic
 from gcl_looper.services.oslo import base as oslo_base
+from gcl_looper.watchdogs import config as watchdogs_config
+
+if tp.TYPE_CHECKING:
+    from gcl_looper.watchdogs import base as wd_base
 
 LOG = logging.getLogger(__name__)
 DOMAIN = "launchpad"
@@ -57,8 +61,9 @@ class LaunchpadService(basic.BasicService, oslo_base.OsloConfigurableService):
         services: tp.Collection[basic.BasicService],
         iter_min_period: float = 1,
         iter_pause: float = 0.1,
+        watchdog: tp.Optional[wd_base.WatchDogBase] = None,
     ):
-        super().__init__(iter_min_period, iter_pause)
+        super().__init__(iter_min_period, iter_pause, watchdog=watchdog)
         self._services = services
         for service in self._services:
             if isinstance(service, basic.BoostableServiceMixin):
@@ -68,6 +73,29 @@ class LaunchpadService(basic.BasicService, oslo_base.OsloConfigurableService):
         LOG.info("Setup all services")
         for service in self._services:
             service._setup()
+
+    def _finish(self) -> None:
+        super()._finish()
+        # The inner services are iterated by the launchpad itself and never
+        # call their own `start()`, so their watchdogs must be released here
+        # when the launchpad goes down. Demote each inner service first so
+        # its _on_lose_master hook runs before the lock is released.
+        for service in self._services:
+            if service._watchdog is not None:
+                try:
+                    service._release_master()
+                except Exception:
+                    LOG.exception(
+                        "Failed to demote %s",
+                        service.__class__.__name__,
+                    )
+                try:
+                    service._watchdog.teardown()
+                except Exception:
+                    LOG.exception(
+                        "Failed to teardown the watchdog of %s",
+                        service.__class__.__name__,
+                    )
 
     def _iteration(self):
         # Iterate all services
@@ -196,6 +224,11 @@ class LaunchpadService(basic.BasicService, oslo_base.OsloConfigurableService):
                     "refused. Requires ``boost_max_iterations`` to be set."
                 ),
             ),
+            # Master election watchdog for the whole launchpad. When
+            # several launchpads run on different nodes, only the one
+            # holding the lock iterates its services (unless the inner
+            # services configure their own watchdogs).
+            *watchdogs_config.get_config_opts(),
         ]
 
     @classmethod
@@ -283,11 +316,28 @@ class LaunchpadService(basic.BasicService, oslo_base.OsloConfigurableService):
                 services.append(svc)
             LOG.info("Service %s loaded, %d instance(s)", svc_name, count)
 
+        # Master election watchdog for the launchpad itself (optional)
+        watchdog = watchdogs_config.build_watchdog(
+            lock_type=launchpad_cfg[DOMAIN].watchdog_lock_type,
+            connection_url=launchpad_cfg[DOMAIN].watchdog_connection_url,
+            lock_key=launchpad_cfg[DOMAIN].watchdog_lock_key,
+            heartbeat_timeout=launchpad_cfg[DOMAIN].watchdog_heartbeat_timeout,
+            lock_timeout=launchpad_cfg[DOMAIN].watchdog_lock_timeout,
+            table_name=launchpad_cfg[DOMAIN].watchdog_table_name,
+            create_table=launchpad_cfg[DOMAIN].watchdog_create_table,
+        )
+        if watchdog is not None:
+            LOG.info(
+                "Master election watchdog enabled for the launchpad: %r",
+                watchdog,
+            )
+
         # Create global service
         launchpad_service = cls(
             services=services,
             iter_min_period=launchpad_cfg[DOMAIN].iter_min_period,
             iter_pause=launchpad_cfg[DOMAIN].iter_pause,
+            watchdog=watchdog,
         )
 
         # Configure boost overheat protection if any of the options is set.
