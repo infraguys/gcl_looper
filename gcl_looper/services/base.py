@@ -17,6 +17,10 @@
 import abc
 import logging
 import signal
+import typing as tp
+
+if tp.TYPE_CHECKING:
+    from gcl_looper.election import base as elector_base
 
 LOG = logging.getLogger(__name__)
 
@@ -24,11 +28,20 @@ LOG = logging.getLogger(__name__)
 class AbstractService(abc.ABC):
     __mp_downgrade_user__ = None
 
-    def __init__(self):
+    def __init__(self, elector=None):
+        """
+        Args:
+            elector: Optional leader elector guarding the service
+                iterations, e.g. a ``gcl_looper.election`` master
+                election elector. When it does not hold the leadership,
+                the iterations are skipped; the lock is released
+                automatically on ``_finish()``.
+        """
         super(AbstractService, self).__init__()
         self._setups = []
         self._finishes = []
         self._should_subscribe_signals = True
+        self._elector = elector
 
     @property
     def should_subscribe_signals(self):
@@ -72,11 +85,26 @@ class AbstractService(abc.ABC):
     def add_finishes(self, finish_func):
         self._finishes.append(finish_func)
 
+    def get_elector(self) -> "tp.Optional[elector_base.LeaderElector]":
+        """Return the leader elector guarding this service (may be ``None``)."""
+        return self._elector
+
+    def ensure_master(self) -> None:
+        """Raise if the elector reports that the service lost leadership."""
+        if self._elector is not None:
+            self._elector.ensure_leadership()
+
     def _finish(self):
         LOG.info("Finish loop")
         for finish_func in self._finishes:
             finish_func()
-        pass
+        # Release the master lock (if any) so a standby node can take over
+        # immediately instead of waiting for the lock to expire.
+        if self._elector is not None:
+            try:
+                self._elector.close()
+            except Exception:
+                LOG.exception("Failed to close the leader elector")
 
     def _get_sig_handlers(self):
         def stop_callback(s, frame):
