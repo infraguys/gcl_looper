@@ -25,6 +25,20 @@ jobs:
           tox -e ruff-check
   tests:
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: gcltest
+          POSTGRES_PASSWORD: test
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d gcltest"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     strategy:
       fail-fast: true
       matrix:
@@ -44,5 +58,7 @@ jobs:
         run: |
           tox -e ${{ matrix.python-version }}
       - name: Functional tests
+        env:
+          GCL_LOOPER_TEST_PG_URL: postgresql://postgres:test@127.0.0.1:5432/gcltest
         run: |
           tox -e ${{ matrix.python-version }}-functional

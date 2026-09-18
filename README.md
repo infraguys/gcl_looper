@@ -315,3 +315,165 @@ project_id = 123
 name = bar1
 project_id = 456
 ```
+
+### Leader (master) election
+
+When the same daemon runs on several nodes, you usually want only **one**
+instance (the *master*) to do the real work while the others stay on standby.
+GCL Looper implements this with a `LeaderElector`: every service iteration
+asks the elector for the leadership (backed by a distributed lock); only the
+node that owns the lock runs the iteration, the others silently skip it until
+they take over.
+
+This is a port of the MySQL `GET_LOCK`/table-lock mechanism from the original
+`rooster`/`node-manager` stack, rebuilt around a clean election abstraction
+and a database-agnostic lock-driver interface. Only PostgreSQL ships today,
+but a new backend (e.g. MySQL) is added by implementing one small driver
+class and registering it.
+
+**Install the PostgreSQL extra:**
+
+```bash
+pip install gcl_looper[pg]   # brings in psycopg (v3)
+```
+
+#### Two PostgreSQL lock backends
+
+* `postgres_advisory` — session-level advisory locks (`pg_try_advisory_lock`).
+  A direct port of MySQL `GET_LOCK`: non-blocking acquire and **instant
+  failover** (the lock dies the moment the session/connection drops). The
+  elector keeps its **own dedicated connection** and never shares the
+  application pool (restalchemy/psycopg_pool keep working as usual).
+* `postgres_table` — a lock row in a table with an atomic `UPDATE`. Portable
+  across databases and works through a normal connection. A dead master is
+  taken over after `lock_timeout` seconds (the original node-manager used this
+  style).
+
+#### Programmatic usage
+
+```python
+from gcl_looper.election import db
+from gcl_looper.election.drivers import pg_table
+from gcl_looper.services import basic
+
+elector = db.DbLeaderElector(
+    pg_table.PostgresTableLockDriver(
+        connection_url="postgresql://user:pass@db:5432/mydb",
+        lock_key="my_master_service",
+        lock_timeout=30,
+    ),
+)
+
+
+class MyMasterService(basic.BasicService):
+    def _iteration(self):
+        # Runs only on the node that currently holds the lock.
+        self.ensure_master()
+        print("I am the master now")
+
+    # Optional hooks, fired on every leadership transition:
+    def _on_become_master(self):
+        ...  # create master-only resources
+
+    def _on_lose_master(self):
+        ...  # release them
+
+# Every iteration is guarded: when another node is the master the iteration
+# is skipped. Only one node is the master at a time.
+MyMasterService(elector=elector).start()
+```
+
+A service without an elector is always the master (unchanged behavior). The
+lock is released automatically on shutdown so a standby takes over
+immediately (table locks also expire by themselves after `lock_timeout`).
+
+Locks are refreshed at iteration boundaries; no background refresh runs while
+business code is executing. Long-running work can call `self.ensure_master()`
+to verify ownership and refresh a table lease. A lease cannot revoke Python
+code between a successful check and its next side effect, so operations that
+must reject stale masters need a fencing token or an equivalent destination
+check.
+Boost is refused with a warning while the service or its launchpad is in
+standby. Losing leadership resets boost for the complete nested service tree.
+
+#### Launchpad / oslo configuration
+
+The whole launchpad (or any single service) can be guarded through config.
+Add the election options to the `[launchpad]` section (they use the
+`election_` prefix):
+
+```ini
+[launchpad]
+services =
+    my_package.service_foo:FooService
+# Master election for the whole launchpad:
+election_backend = postgres_advisory
+election_connection_url = postgresql://user:pass@db:5432/mydb
+election_lock_key = my_daemon_master
+election_refresh_interval = 2
+# Table-based locks only:
+election_lock_timeout = 30
+election_table_name = gcl_looper_locks
+```
+
+While a node is master, lock ownership is checked in the service thread on the
+first iteration after `election_refresh_interval` elapses. Calling
+`ensure_master()` performs an immediate backend check and refreshes a table
+lease. For table locks, `lock_timeout` must exceed the maximum permitted time
+between these checks, including iteration time and scheduling delays. A stuck
+iteration therefore stops refreshing its lease and allows takeover. Standby
+nodes retry at their normal, non-boosted service pace.
+
+When `election_backend` is set, the launchpad runs its inner services only
+while it owns the lock; standby launchpads stay idle. Configure election either
+for the whole launchpad or for individual services, not at both levels.
+`election_backend` accepts `none` (default), `always`, or a registered lock
+driver (`postgres_advisory`, `postgres_table`, ...).
+
+To guard an individual service instead of the whole launchpad, register the
+same options (with any prefix) in the service's `svc_get_config_opts` and
+build the elector in its constructor:
+
+```python
+from gcl_looper.election import config as election_config
+
+
+class MyMasterService(basic.BasicService):
+    @classmethod
+    def svc_get_config_opts(cls):
+        return [
+            # ... own options ...
+            *election_config.get_config_opts(),
+        ]
+
+    def __init__(self, name, **kwargs):
+        elector, kwargs = election_config.build_elector_from_kwargs(
+            default_lock_key=f"{name}_lock", **kwargs
+        )
+        super().__init__(elector=elector, **kwargs)
+```
+
+#### Adding a new database (e.g. MySQL)
+
+1. Subclass `gcl_looper.election.drivers.base.BaseLockDriver` (for a table
+   lock it is usually enough to subclass
+   `gcl_looper.election.drivers.table.TableLockDriver` and override the
+   connection and SQL-flavor hooks), or
+2. register it by name and select it via `election_backend`:
+
+```python
+from gcl_looper.election.drivers import register_driver
+
+register_driver("mysql", "my_package.locks:MySQLTableLockDriver")
+```
+
+#### Running the functional tests
+
+The PostgreSQL functional tests are skipped unless a server is provided:
+
+```bash
+podman run -d --name gcl_looper_pg -e POSTGRES_PASSWORD=*** \
+    -e POSTGRES_DB=gcltest -p 5433:5432 docker.io/library/postgres:18
+GCL_LOOPER_TEST_PG_URL=postgresql://postgres:test@127.0.0.1:5433/gcltest \
+    pytest gcl_looper/tests/functional/election
+```
