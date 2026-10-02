@@ -112,7 +112,7 @@ class BoostableServiceMixin:
 
         Returns:
             True if the boost has been applied, False if it has been
-            refused because of a cooldown (own or ancestor).
+            refused because of a cooldown or standby service in the tree.
         """
         if iter_min_period < 0:
             raise ValueError("`iter_min_period` can not be negative")
@@ -126,6 +126,16 @@ class BoostableServiceMixin:
                 "`iter_min_period` and `iter_pause` — "
                 "this would cause an infinite busy-loop"
             )
+
+        standby = self._get_standby_boost_ancestor()
+        if standby is not None:
+            standby._reset_boost_tree()
+            LOG.warning(
+                "Boost refused for %s: %s is in standby; boost tree reset",
+                self.__class__.__name__,
+                standby.__class__.__name__,
+            )
+            return False
 
         spec = BoostSpec(float(iter_min_period), float(iter_pause))
 
@@ -343,6 +353,24 @@ class BoostableServiceMixin:
             parent = parent._boost_parent
         return False
 
+    def _get_standby_boost_ancestor(
+        self,
+    ) -> typing.Optional["BoostableServiceMixin"]:
+        service = self
+        while service is not None:
+            if not getattr(service, "is_master", True):
+                return service
+            service = service._boost_parent
+        return None
+
+    def _reset_boost_tree(self) -> None:
+        self.reset_boost()
+        with self._boost_lock:
+            self._boosted_iteration_count = 0
+            children = list(self._boost_children)
+        for child in children:
+            child._reset_boost_tree()
+
     def _boost_changed(self) -> None:
         """Wake this service and its boost parent after a pacing change."""
         self._wake_event.set()
@@ -416,13 +444,25 @@ class BoostableServiceMixin:
 class BasicService(BoostableServiceMixin, base.AbstractService):
     __log_iteration__ = True
 
-    def __init__(self, iter_min_period=1, iter_pause=0.1):
-        super(BasicService, self).__init__()
+    def __init__(self, iter_min_period=1, iter_pause=0.1, elector=None):
+        super(BasicService, self).__init__(elector=elector)
         self._enabled = False
         self._stop_event = threading.Event()
         self._iter_min_period = iter_min_period
         self._iter_pause = iter_pause
         self._iteration_number = 0
+        self._is_master = False
+
+    @property
+    def is_master(self) -> bool:
+        """Whether the service is allowed to do its work now.
+
+        ``True`` when the service has no elector (it always acts as the
+        master) or when the elector currently holds the master lock.
+        """
+        if self._elector is None:
+            return True
+        return self._is_master and bool(self._elector.is_leader)
 
     def _loop_iteration(self):
         iteration = self._iteration_number
@@ -433,7 +473,7 @@ class BasicService(BoostableServiceMixin, base.AbstractService):
                 self.__class__.__name__,
             )
         try:
-            self._iteration()
+            self._guarded_iteration(iteration)
             if self.__log_iteration__:
                 LOG.debug(
                     "Iteration #%d finished for %s",
@@ -449,6 +489,138 @@ class BasicService(BoostableServiceMixin, base.AbstractService):
         finally:
             self._iteration_number += 1
             self._consume_boost_iteration()
+
+    def _guarded_iteration(self, iteration: int) -> None:
+        """Call ``_iteration()`` guarded by the elector (if any).
+
+        When the elector does not hold the master lock (another node is
+        the master), ``try_lead()`` returns ``False`` and the iteration is
+        silently skipped: this is how standby instances wait on their
+        nodes without doing any work until they take over.
+        """
+        elector = self._elector
+        if elector is None:
+            self._iteration()
+            return
+
+        become_failed = False
+        try:
+            if elector.try_lead():
+                if not self._update_master_state():
+                    # The become-master hook failed: do not run the
+                    # iteration. The state was reset so the hook will be
+                    # retried on the next iteration.
+                    become_failed = True
+                    return
+                self._iteration()
+            else:
+                # Not the master (anymore or yet): skip this iteration.
+                LOG.debug(
+                    "Skipping iteration #%d for %s: not the master",
+                    iteration,
+                    self.__class__.__name__,
+                )
+        finally:
+            # Synchronize the master state and fire the hooks on every
+            # transition, including the transitions caused by exceptions
+            # (e.g. a lost database connection demotes the node). Skip
+            # the sync when the become hook failed: the state was already
+            # rolled back and re-syncing would re-trigger the failing hook.
+            if not become_failed:
+                self._update_master_state()
+
+    def _update_master_state(self) -> bool:
+        """Detect master state transitions and notify the service.
+
+        Returns ``False`` when the become-master hook failed (the service
+        should skip the current iteration); ``True`` otherwise.
+        """
+        elector = self._elector
+        if elector is None:
+            return True
+
+        is_master = bool(elector.is_leader)
+        if is_master == self._is_master:
+            return True
+        self._is_master = is_master
+
+        if is_master:
+            LOG.info("%s has acquired the master lock", self.__class__.__name__)
+            try:
+                self._on_become_master()
+            except Exception:
+                LOG.exception(
+                    "Unexpected error in _on_become_master() of %s",
+                    self.__class__.__name__,
+                )
+                # Release leadership so a healthy standby can take over
+                # instead of letting this instance monopolize the lock while
+                # its master-only resources can not be initialized.
+                self._is_master = False
+                try:
+                    elector.close()
+                except Exception:
+                    LOG.exception(
+                        "Failed to release leadership after _on_become_master() "
+                        "failed for %s",
+                        self.__class__.__name__,
+                    )
+                return False
+        else:
+            self._reset_boost_tree()
+            LOG.warning(
+                "%s has lost the master lock; boost tree reset",
+                self.__class__.__name__,
+            )
+            try:
+                self._on_lose_master()
+            except Exception:
+                LOG.exception(
+                    "Unexpected error in _on_lose_master() of %s",
+                    self.__class__.__name__,
+                )
+        return True
+
+    def _on_become_master(self) -> None:
+        """Hook called when the service acquires the master lock.
+
+        Create/reload the resources that must exist only while the service
+        is the master (DB engines, consumers, schedulers, ...). Exceptions
+        here are logged and do not break the loop.
+        """
+
+    def _on_lose_master(self) -> None:
+        """Hook called when the service loses the master lock.
+
+        Release the master-only resources; the service will try to take the
+        leadership again on the next iterations.
+        """
+
+    def _release_master(self) -> None:
+        """Demote the service if it is currently the master.
+
+        Calls :meth:`_on_lose_master` exactly once and resets the master
+        flag. Used during shutdown so master-only resources are cleaned up
+        before the lock is released.
+        """
+        if not self._is_master:
+            return
+        LOG.info("%s releasing the master lock on shutdown", self.__class__.__name__)
+        try:
+            self._on_lose_master()
+        except Exception:
+            LOG.exception(
+                "Unexpected error in _on_lose_master() of %s",
+                self.__class__.__name__,
+            )
+        finally:
+            self._is_master = False
+
+    def _finish(self) -> None:
+        # Demote before the elector releases the lock so master-only
+        # resources are cleaned up while we still hold the leadership.
+        self._release_master()
+        super()._finish()
 
     def _loop(self):
         self._enabled = True
