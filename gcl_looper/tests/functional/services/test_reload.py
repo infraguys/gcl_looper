@@ -15,6 +15,10 @@
 #    under the License.
 
 import functools
+import multiprocessing
+import json
+import socket
+import uuid
 import os
 import signal
 import threading
@@ -96,7 +100,7 @@ def running_hub(tmp_path):
         started.append((h, thread))
         _wait_for(
             lambda: (
-                len(h._instances) == workers
+                len(h._instances) == 1
                 and all(i.ready.is_set() for i in h._instances.values())
             )
         )
@@ -114,6 +118,7 @@ def test_reload_replaces_workers_without_failed_requests(running_hub):
     h, version_file = running_hub(port)
     old = list(h._instances.values())
     old_pids = {i.pid for i in old}
+    old_workers = {_get(port)[1] for _ in range(40)}
 
     failures = []
     served = []
@@ -145,9 +150,12 @@ def test_reload_replaces_workers_without_failed_requests(running_hub):
 
     assert not failures
     new_pids = {i.pid for i in h._instances.values()}
-    assert len(new_pids) == 2
+    assert len(new_pids) == 1
     assert not new_pids & old_pids
-    assert {pid for v, pid in served if v == "v2"} <= new_pids
+    new_workers = {_get(port)[1] for _ in range(40)}
+    assert len(new_workers) == 2
+    assert new_workers.isdisjoint(old_workers)
+    assert {pid for v, pid in served if v == "v2"} <= new_workers
     # Only the new generation serves after the reload.
     assert all(_get(port)[0] == "v2" for _ in range(20))
 
@@ -222,30 +230,25 @@ def test_stop_racing_a_reload_leaves_no_workers(running_hub):
     version_file.write_text("v2")
     h.reload()
 
-    _wait_for(lambda: len(spawned) == 4 and not any(i.is_alive() for i in spawned))
+    _wait_for(lambda: len(spawned) == 2 and not any(i.is_alive() for i in spawned))
 
 
-def test_spawn_failing_midway_leaves_no_workers(running_hub):
+def test_launch_failure_keeps_old_workers(running_hub):
     port = 8098
     h, version_file = running_hub(port)
-    old_pids = {i.pid for i in h._instances.values()}
-    spawn = h._spawn
-    spawned = []
+    old = dict(h._instances)
 
-    def spawn_once(factory):
-        if spawned:
-            raise OSError("fork failed")
-        spawned.append(spawn(factory))
-        return spawned[-1]
+    def fail(factory):
+        raise OSError("exec failed")
 
-    h._spawn = spawn_once
+    h._spawn = fail
     version_file.write_text("v2")
     done = h._iteration_number
     h.reload()
     _wait_for(lambda: h._iteration_number > done + 1)
 
-    assert not spawned[0].is_alive()
-    assert {i.pid for i in h._instances.values()} == old_pids
+    assert h._instances == old
+    assert all(i.is_alive() for i in old.values())
     assert _get(port)[0] == "v1"
 
 
@@ -291,9 +294,9 @@ def test_stop_during_drain_bounds_both_generations():
     thread = None
     try:
         for _ in range(2):
-            started = h._mp_context.Event()
-            terminated = h._mp_context.Event()
-            process = h._mp_context.Process(
+            started = multiprocessing.get_context("fork").Event()
+            terminated = multiprocessing.get_context("fork").Event()
+            process = multiprocessing.get_context("fork").Process(
                 target=_stubborn_worker, args=(started, terminated)
             )
             process.start()
@@ -344,9 +347,19 @@ def test_stalled_setup_does_not_take_traffic(running_hub):
 class _TrackerProbe(bjoern_service.base.AbstractService):
     __mp_downgrade_user__ = "nobody"
 
-    def __init__(self, connection, early_drop=False, automatic_drop=True):
+    def __init__(
+        self, address, early_drop=False, automatic_drop=True, factory_drop=False
+    ):
         super().__init__()
-        self.connection = connection
+        self.address = address
+        from multiprocessing import resource_tracker
+
+        # Start a real privileged tracker before any factory/setup UID change.
+        resource_tracker.ensure_running()
+        if factory_drop:
+            from gcl_looper import utils
+
+            utils.downgrade_user_group_privileges()
         if not automatic_drop:
             self.__mp_downgrade_user__ = None
         if early_drop:
@@ -364,8 +377,12 @@ class _TrackerProbe(bjoern_service.base.AbstractService):
         memory.close()
         memory.unlink()
         tracker_uid = os.stat(f"/proc/{tracker._pid}").st_uid
-        self.connection.send((os.getuid(), detached, tracker_uid))
-        self.connection.close()
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.connect(self.address)
+            connection.sendall(
+                json.dumps((os.getuid(), detached, tracker_uid)).encode()
+            )
+            assert connection.recv(1) == b"R"
 
     def stop(self):
         pass
@@ -373,30 +390,45 @@ class _TrackerProbe(bjoern_service.base.AbstractService):
 
 @pytest.mark.skipif(os.getuid() != 0, reason="requires root to drop worker privileges")
 @pytest.mark.parametrize(
-    "early_drop, automatic_drop", [(False, True), (True, True), (True, False)]
+    "early_drop, automatic_drop, factory_drop",
+    [
+        (False, True, False),
+        (True, True, False),
+        (True, False, False),
+        (False, False, True),
+    ],
 )
+@pytest.mark.parametrize("replicas", [1, 2])
 def test_privilege_drop_detaches_tracker_and_preserves_readiness(
-    early_drop, automatic_drop
+    early_drop, automatic_drop, factory_drop, replicas
 ):
     import pwd
 
     h = hub.ReloadableProcessHubService()
-    parent, child = h._mp_context.Pipe(duplex=False)
-    worker = h._spawn(
-        functools.partial(_TrackerProbe, child, early_drop, automatic_drop)
-    )
-    child.close()
-    try:
-        assert worker.ready.wait(timeout=15)
-        assert parent.poll(15)
-        uid, detached, tracker_uid = parent.recv()
-        assert uid == pwd.getpwnam("nobody").pw_uid
-        assert detached
-        assert tracker_uid == uid
-        worker.join(timeout=5)
-        assert worker.exitcode == 0
-    finally:
-        if worker.is_alive():
+    address = "\0looper-tracker-probe-" + uuid.uuid4().hex
+    with socket.socket(socket.AF_UNIX) as parent:
+        parent.bind(address)
+        parent.listen()
+        parent.settimeout(15)
+        factory = functools.partial(
+            _TrackerProbe, address, early_drop, automatic_drop, factory_drop
+        )
+        worker = h._spawn(
+            functools.partial(hub._build_generation, [factory] * replicas)
+        )
+        try:
+            assert worker.ready.wait(timeout=15)
+            for _ in range(replicas):
+                connection, _ = parent.accept()
+                with connection:
+                    uid, detached, tracker_uid = json.loads(connection.recv(1024))
+                    connection.sendall(b"R")
+                assert uid == pwd.getpwnam("nobody").pw_uid
+                assert detached
+                assert tracker_uid == uid
+            worker.join(timeout=5)
+            assert worker.exitcode == 0
+        finally:
             worker.kill()
-        worker.join(timeout=5)
-        parent.close()
+            worker.join(timeout=5)
+            worker.close()

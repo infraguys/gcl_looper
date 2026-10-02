@@ -56,10 +56,9 @@ def test_mp_start_stop_services(prepared_service):
 
     h.start()
 
-    # Allow some iterations to run. The hub exits immediately after
-    # its single iteration (OneTimeProcessHub sets _enabled = False),
-    # so the child process's entire run time comes from this sleep.
-    time.sleep(0.5)
+    deadline = time.monotonic() + 5
+    while prepared_service._value.value <= 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
     instance = h._instances[prepared_service]
 
     assert instance.is_alive()
@@ -77,9 +76,7 @@ def test_mp_start_stop_services(prepared_service):
         instance.join(timeout=0.1)
 
     assert not instance.is_alive(), "Service did not stop gracefully"
-    assert prepared_service._value.value == -1, (
-        "Service stop() did not set value to -1"
-    )
+    assert prepared_service._value.value == -1, "Service stop() did not set value to -1"
 
 
 def test_mp_service_died(prepared_service):
@@ -120,8 +117,9 @@ def test_mp_stop_by_signal(prepared_service):
     hub_thread.start()
 
     try:
-        # Allow some iterations to run
-        time.sleep(0.3)
+        deadline = time.monotonic() + 5
+        while prepared_service._value.value < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
         instance = h._instances[prepared_service]
 
         assert instance.is_alive()
@@ -138,6 +136,8 @@ def test_mp_stop_by_signal(prepared_service):
         assert not instance.is_alive(), "Service did not stop after SIGTERM"
         assert prepared_service._value.value == -1
     finally:
+        h.stop()
+        hub_thread.join(timeout=5)
         signal.signal(signal.SIGTERM, original_handler)
 
 
