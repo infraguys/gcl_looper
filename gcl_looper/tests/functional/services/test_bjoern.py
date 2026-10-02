@@ -19,6 +19,7 @@ import multiprocessing
 import os
 import requests
 import signal
+import socket
 
 import pytest
 
@@ -38,38 +39,44 @@ def wsgi_app():
     return MockWSGISubclass()
 
 
-def run_service(*args, **kwargs):
+def run_service(*args, ready, **kwargs):
     service = bjoern_service.BjoernService(*args, **kwargs)
+    loop = service._loop
+
+    def loop_and_publish_ready():
+        ready.set()
+        loop()
+
+    service._loop = loop_and_publish_ready
     service.start()
 
 
 class TestBjoernService:
     def test_start_and_stop(self, wsgi_app):
-        self.host = "127.0.0.1"
-        self.port = 8082
-
-        process = multiprocessing.get_context("fork").Process(
-            target=run_service, args=(wsgi_app, self.host, self.port)
+        host = "127.0.0.1"
+        with socket.socket() as sock:
+            sock.bind((host, 0))
+            port = sock.getsockname()[1]
+        context = multiprocessing.get_context("fork")
+        ready = context.Event()
+        process = context.Process(
+            target=run_service, args=(wsgi_app, host, port), kwargs={"ready": ready}
         )
         process.start()
-
-        assert process.is_alive()
-
-        url = "http://%s:%s/" % (self.host, self.port)
-        response = requests.get(url)
-
-        assert response.status_code == 200
-        assert response.text == "TESTBJOERN"
-        assert process.is_alive()
-
-        # NOTE(g.melikov): see comment in BjoernService._exit_gracefully()
-        for i in range(10):
-            print(i)
-            if not process.is_alive() or process.join(timeout=1):
-                break
-            try:
-                os.kill(process.pid, signal.SIGINT)
-            except ProcessLookupError:
-                pass
-
-        assert not process.is_alive(), "Bjoern did not stop gracefully"
+        try:
+            assert ready.wait(10), "Bjoern did not start"
+            response = requests.get(
+                f"http://{host}:{port}/", headers={"Connection": "close"}, timeout=5
+            )
+            assert response.status_code == 200
+            assert response.text == "TESTBJOERN"
+            assert process.is_alive()
+            os.kill(process.pid, signal.SIGINT)
+            process.join(timeout=5)
+            assert not process.is_alive(), "Bjoern did not stop gracefully"
+            assert process.exitcode == 0
+        finally:
+            if process.is_alive():
+                process.kill()
+            process.join(timeout=5)
+            process.close()
