@@ -237,6 +237,46 @@ from gcl_looper import utils
 utils.downgrade_user_group_privileges("nobody")
 ```
 
+### Reloadable Process Hub service
+
+`ReloadableProcessHubService` replaces its workers on `SIGHUP` without downtime, e.g. to serve an upgraded package. Workers are built by factories in fresh interpreters (`spawn`), so they load the code currently on disk. A new generation starts next to the old one and the old one drains only after every new worker is ready; if a new worker fails, the old generation keeps serving. `BjoernService` binds its socket before running setup callbacks and starts listening only after they succeed. Readiness is published after the complete service setup. Spawn workers that drop root privileges detach from the parent resource tracker; any tracker they subsequently need runs under their own UID. Filesystem Unix sockets require Linux `/proc/self/fd`: binding and cleanup use pinned directory descriptors so renaming a parent directory cannot redirect cleanup. Cleanup removes the entry only if it still identifies the socket created by the service.
+
+* A factory is a picklable callable (module-level function or its `functools.partial`) returning a service; it runs in the worker, so it parses config and configures logging itself.
+* Both generations must share the listening address: `BjoernService` with `reuse_port=True`.
+* Set `net.ipv4.tcp_migrate_req=1` (Linux 5.14+) so connections queued on a closing listener move to a live one.
+* `ready_timeout` bounds the start of a new generation, `drain_timeout` the drain of an old one. bjoern keeps serving open keep-alive connections while draining, so behind a keep-alive client the old worker is killed at `drain_timeout`.
+
+```python
+import functools
+import sys
+
+from gcl_looper.services import bjoern_service
+from gcl_looper.services import hub
+
+
+def build_worker(argv):
+    parse_config(argv)
+    return bjoern_service.BjoernService(
+        wsgi_app=build_app(),
+        host="0.0.0.0",
+        port=8080,
+        bjoern_kwargs=dict(reuse_port=True),
+    )
+
+
+def main():
+    serv_hub = hub.ReloadableProcessHubService()
+    for _ in range(4):
+        serv_hub.add_service_factory(functools.partial(build_worker, sys.argv[1:]))
+    serv_hub.start()
+
+
+if __name__ == "__main__":  # required by the spawn start method
+    main()
+```
+
+With systemd: `ExecReload=/bin/kill -HUP $MAINPID`, then `systemctl reload <unit>`.
+
 ### Launchpad Service
 
 Launchpad service is a service that can run multiple services and execute them sequentially. It's convenient when you have multiple services that need to be run in a specific order or the services aren't heavy and you don't want to use multiprocessing. Also it simplifies the configuration of the services.
