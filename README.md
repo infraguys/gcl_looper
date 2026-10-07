@@ -249,7 +249,8 @@ With one worker the service runs directly, without an intermediate master.
 Readiness uses a pipe; the hub starts no multiprocessing resource tracker.
 Factory payloads travel through a separate stdin pipe, closed before application
 code runs. Child interpreters preserve the supervisor's Python isolation flags
-and import paths.
+and import paths. Payload transfer and worker readiness share `ready_timeout`;
+`stop()` interrupts a blocked transfer.
 
 On `SIGHUP` or `reload()`, a new generation starts beside the old one. Only after
 all new workers finish setup does the old master receive `SIGTERM`. If startup
@@ -315,7 +316,7 @@ iteration (one second by default), replacing generations on edits, additions or
 deletions. Development generations compile Python source directly, bypassing
 bytecode caches (including `PYTHONPYCACHEPREFIX`); cached files are left untouched.
 A filesystem scan error disables autoreload and keeps the current services running;
-manual reload remains available.
+manual reload remains available and continues compiling source directly.
 Autoreload uses only the standard library and starts no threads or processes;
 `autoreload=False` (the default) disables discovery and scanning in production.
 With systemd: `ExecReload=/bin/kill -HUP $MAINPID`, then `systemctl reload <unit>`.

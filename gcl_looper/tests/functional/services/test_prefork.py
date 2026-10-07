@@ -317,7 +317,10 @@ def test_package_main_is_not_replayed(tmp_path):
 
 
 @pytest.mark.parametrize("relocated_cache", [False, True])
-def test_dev_generation_bypasses_same_second_bytecode(tmp_path, relocated_cache):
+@pytest.mark.parametrize("watcher_failed", [False, True])
+def test_dev_generation_bypasses_same_second_bytecode(
+    tmp_path, relocated_cache, watcher_failed
+):
     source = tmp_path / "cached_service.py"
     output = tmp_path / "result"
     source.write_text("VERSION = 'old'\n")
@@ -326,7 +329,7 @@ def test_dev_generation_bypasses_same_second_bytecode(tmp_path, relocated_cache)
     runner = tmp_path / "runner.py"
     runner.write_text(
         "from pathlib import Path\n"
-        "import os, py_compile\n"
+        "import os, py_compile, time\n"
         "from gcl_looper.services import base, hub\n"
         "class Probe(base.AbstractService):\n"
         "    def _loop(self):\n"
@@ -340,7 +343,23 @@ def test_dev_generation_bypasses_same_second_bytecode(tmp_path, relocated_cache)
         f"    os.utime({str(source)!r}, ns=({timestamp + 1000}, {timestamp + 1000}))\n"
         "    service = hub.ReloadableProcessHubService(autoreload=True, iter_min_period=0.05)\n"
         "    service.add_service_factory(factory)\n"
-        "    service.start()\n"
+        + (
+            "    def fail_scan(): raise PermissionError('scan failed')\n"
+            "    service._snapshot_sources = fail_scan\n"
+            "    service._initial_ready = service._enabled = True\n"
+            "    service._iteration()\n"
+            "    assert not service.autoreload\n"
+            "    service.reload()\n"
+            "    service._iteration()\n"
+            "    try:\n"
+            "        deadline = time.monotonic() + 5\n"
+            f"        while not Path({str(output)!r}).exists() and time.monotonic() < deadline:\n"
+            "            time.sleep(0.01)\n"
+            f"        assert Path({str(output)!r}).exists()\n"
+            "    finally: service._finish()\n"
+            if watcher_failed
+            else "    service.start()\n"
+        )
     )
     env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(tmp_path)] + sys.path))
     if relocated_cache:
@@ -467,3 +486,57 @@ def test_factory_payload_can_exceed_pipe_capacity(tmp_path):
         assert json.loads(output.read_text()) == [identity]
     finally:
         process.close()
+
+
+@pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "stop"])
+def test_blocked_payload_write_is_bounded_and_cleans_up(
+    api, tmp_path, monkeypatch, cancel
+):
+    service, _, port = api
+    old = service._instances[0]
+    service._ready_timeout = 60 if cancel else 0.3
+    service._factories = [
+        functools.partial(_snapshot_factory, tmp_path, "large payload " * 100000)
+    ]
+    launched = threading.Event()
+    finished = threading.Event()
+    processes = []
+    launch = subprocess.Popen.__init__
+
+    def stalled_launch(process, args, **kwargs):
+        args = list(args)
+        args[args.index("-c") + 1] = (
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "time.sleep(60)\n"
+        )
+        launch(process, args, **kwargs)
+        processes.append(process)
+        launched.set()
+
+    monkeypatch.setattr(subprocess.Popen, "__init__", stalled_launch)
+    reload_generation = service._reload
+
+    def reload_and_notify():
+        try:
+            reload_generation()
+        finally:
+            finished.set()
+
+    service._reload = reload_and_notify
+    service.reload()
+    try:
+        assert launched.wait(5)
+        if cancel:
+            service.stop()
+        assert finished.wait(3)
+        assert service._instances[0] is old
+        assert processes[0].returncode is not None
+        assert processes[0].stdin.closed
+        assert processes[0].ready.fd is None
+        if not cancel:
+            assert old.is_alive()
+            assert _get(port)[0] == "original"
+    finally:
+        for process in processes:
+            process.kill()

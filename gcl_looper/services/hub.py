@@ -182,9 +182,34 @@ class _Readiness:
             self.fd = None
 
 
+class _PayloadWriter:
+    def __init__(self, fd, deadline, stop_event):
+        self.fd = fd
+        self.deadline = deadline
+        self.stop_event = stop_event
+        os.set_blocking(fd, False)
+
+    def write(self, data):
+        pending = memoryview(data)
+        while pending:
+            if self.stop_event is not None and self.stop_event.is_set():
+                raise InterruptedError("Generation stopped during payload transfer")
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Generation payload transfer timed out")
+            if select.select([], [self.fd], [], min(remaining, 0.1))[1]:
+                try:
+                    pending = pending[os.write(self.fd, pending) :]
+                except BlockingIOError:
+                    continue
+        return len(data)
+
+
 class _ServiceProcess(subprocess.Popen):
-    def __init__(self, factory, autoreload=False):
+    def __init__(self, factory, autoreload=False, deadline=None, stop_event=None):
         self._group_closed = False
+        if deadline is None:
+            deadline = time.monotonic() + 60
         # Restore trusted paths before importing the launcher, without adding CWD.
         bootstrap = "import sys\nsys.path = " + repr(sys.path) + "\n"
         if autoreload:
@@ -226,9 +251,10 @@ class _ServiceProcess(subprocess.Popen):
             os.close(write_fd)
         self.ready = _Readiness(read_fd)
         try:
-            # The child reads concurrently, so payloads can exceed pipe capacity.
             with self.stdin:
-                pickle.dump(payload, self.stdin)
+                pickle.dump(
+                    payload, _PayloadWriter(self.stdin.fileno(), deadline, stop_event)
+                )
         except BaseException:
             self.close()
             raise
@@ -331,11 +357,13 @@ class ReloadableProcessHubService(ProcessHubService):
     ):
         super().__init__(*args, **kwargs)
         self._ready_timeout = ready_timeout
+        self._ready_deadline = None
         self._drain_timeout = drain_timeout
         self._factories = []
         self._reload_requested = False
         self._stop_deadline = None
         self.autoreload = autoreload
+        self._load_source = autoreload
         self._reload_dirs = []
         self._sources = {}
         self._initial_ready = False
@@ -437,9 +465,15 @@ class ReloadableProcessHubService(ProcessHubService):
         self._wake_event.set()
 
     def _spawn(self, factory):
-        return _ServiceProcess(factory, autoreload=self.autoreload)
+        return _ServiceProcess(
+            factory,
+            autoreload=self._load_source,
+            deadline=self._ready_deadline,
+            stop_event=self._stop_event,
+        )
 
     def _spawn_generation(self):
+        self._ready_deadline = time.monotonic() + self._ready_timeout
         if not self._factories:
             return {}
         groups = {}
@@ -469,7 +503,9 @@ class ReloadableProcessHubService(ProcessHubService):
         self._instances = self._spawn_generation()
 
     def _wait_ready(self, generation):
-        deadline = time.monotonic() + self._ready_timeout
+        deadline = self._ready_deadline
+        if deadline is None:
+            deadline = time.monotonic() + self._ready_timeout
         for instance in generation.values():
             while not instance.ready.wait(timeout=0.1):
                 if not instance.is_alive():
