@@ -15,6 +15,7 @@
 import functools
 import importlib
 import json
+import multiprocessing
 import os
 import signal
 import socket
@@ -22,12 +23,15 @@ import sys
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from unittest import mock
 
 import pytest
 import requests
 import psutil
 
+from gcl_looper.services import basic
 from gcl_looper.services import bjoern_service
 from gcl_looper.services import hub
 
@@ -48,6 +52,12 @@ def _factory(directory, port):
         service.add_setup(lambda: time.sleep(60))
     if module.VERSION == "failed_setup":
         service.add_setup(lambda: (_ for _ in ()).throw(RuntimeError("Setup failed")))
+    return service
+
+
+def _factory_with_finish(directory, port):
+    service = _factory(directory, port)
+    service.add_finishes(lambda: (directory / f"finish-{os.getpid()}").touch())
     return service
 
 
@@ -72,7 +82,9 @@ def api(tmp_path, request):
     )
     service.should_subscribe_signals = False
     for _ in range(request.param):
-        service.add_service_factory(functools.partial(_factory, tmp_path, port))
+        service.add_service_factory(
+            functools.partial(_factory_with_finish, tmp_path, port)
+        )
     thread = threading.Thread(target=service.start)
     thread.start()
     try:
@@ -141,6 +153,131 @@ def test_failed_generation_keeps_old_workers(api, code):
     assert service._instances[0] is master
     assert master.is_alive()
     assert _get(port)[0] == "original"
+
+
+def test_bjoern_runs_finishes_on_reload_and_shutdown(api):
+    service, source, port = api
+
+    def serving_workers(master, version):
+        children = psutil.Process(master.pid).children()
+        workers = {child.pid for child in children} or {master.pid}
+        served = set()
+        for _ in range(40):
+            response = _get(port)
+            assert response[0] == version
+            served.add(int(response[1]))
+            if served == workers:
+                break
+        assert served == workers
+        return workers
+
+    old = service._instances[0]
+    old_workers = serving_workers(old, "original")
+    source.write_text("VERSION = 'replacement_with_finishes'\n")
+    service.reload()
+    _wait(lambda: service._instances[0] is not old and old.returncode is not None)
+    assert all((source.parent / f"finish-{pid}").exists() for pid in old_workers)
+
+    new = service._instances[0]
+    new_workers = serving_workers(new, "replacement_with_finishes")
+    service.stop()
+    _wait(lambda: new.returncode is not None)
+    assert all((source.parent / f"finish-{pid}").exists() for pid in new_workers)
+
+
+class _DrainProbe(basic.BasicService):
+    def _iteration(self):
+        pass
+
+
+def _drain_probe(directory, replicated):
+    service = _DrainProbe()
+    if (directory / "replacement").exists():
+        if replicated:
+
+            def drain():
+                (directory / "draining").touch()
+                _wait((directory / "allow_exit").exists)
+
+            service.add_finishes(drain)
+        else:
+            service.add_setup(lambda: _wait((directory / "draining").exists))
+    return service
+
+
+def test_reload_rejects_prefork_master_draining_failed_group(tmp_path):
+    service = hub.ReloadableProcessHubService(ready_timeout=5, drain_timeout=2)
+    service.should_subscribe_signals = False
+    for replicated in (True, True, False):
+        service.add_service_factory(
+            functools.partial(_drain_probe, tmp_path, replicated)
+        )
+    service._setup()
+    service._enabled = True
+    old = service._instances
+    wait_ready = service._wait_ready
+    replacements = {}
+
+    def wait_with_failed_replica(generation):
+        replacements.update(generation)
+        master = replacements[0]
+        assert master.ready.wait(5)
+        workers = psutil.Process(master.pid).children()
+        assert len(workers) == 2
+        workers[0].kill()
+        _wait((tmp_path / "draining").exists)
+        assert master.is_alive()
+        return wait_ready(generation)
+
+    try:
+        assert wait_ready(old)
+        (tmp_path / "replacement").touch()
+        service._wait_ready = wait_with_failed_replica
+        service._reload()
+
+        assert len(replacements) == 2
+        assert service._instances is old
+        assert all(instance.is_alive() for instance in old.values())
+        assert all(not instance.is_alive() for instance in replacements.values())
+    finally:
+        (tmp_path / "allow_exit").touch()
+        service._drain(replacements.values())
+        service._drain(old.values())
+
+
+@dataclass
+class _DataclassProbe(basic.BasicService):
+    directory: Path
+
+    def __post_init__(self):
+        super().__init__()
+
+    def _iteration(self):
+        worker = multiprocessing.current_process()
+        (self.directory / f"{worker.name}-{os.getpid()}").touch()
+
+
+class _HashableDataclassProbe(_DataclassProbe):
+    def __hash__(self):
+        return hash(self.directory)
+
+
+@pytest.mark.parametrize("factory", [_DataclassProbe, _HashableDataclassProbe])
+def test_prefork_tracks_all_equal_service_instances(tmp_path, factory):
+    service = hub.ReloadableProcessHubService(ready_timeout=5, drain_timeout=0.5)
+    service._enabled = True
+    for _ in range(2):
+        service.add_service_factory(functools.partial(factory, tmp_path))
+    instances = service._spawn_generation()
+    try:
+        assert service._wait_ready(instances)
+        _wait(lambda: len(list(tmp_path.iterdir())) == 2)
+        first = next(tmp_path.glob("ForkProcess-1-*"))
+        os.kill(int(first.name.rsplit("-", 1)[1]), signal.SIGKILL)
+        instances[0].join(timeout=3)
+        assert not instances[0].is_alive()
+    finally:
+        service._drain(instances.values())
 
 
 def test_dead_master_cleans_up_workers(api):
@@ -214,14 +351,18 @@ def test_entrypoint_preserves_relative_imports_and_cli(tmp_path, module_entrypoi
             else "VALUE = 'module factory loaded'\n"
         )
         + "from pathlib import Path\n"
-        "import argparse, sys\n"
+        "import argparse, multiprocessing, sys\n"
         "from gcl_looper.services import base, hub\n"
         "class Probe(base.AbstractService):\n"
         "    def __init__(self, output):\n"
         "        super().__init__()\n"
         "        self.output = output\n"
         "    def _loop(self):\n"
-        "        Path(self.output).write_text(VALUE)\n"
+        "        child = multiprocessing.get_context('spawn').Process(\n"
+        "            target=write_output, args=(self.output,))\n"
+        "        child.start()\n"
+        "        child.join(5)\n"
+        "        assert child.exitcode == 0\n"
         "    def stop(self):\n"
         "        pass\n"
         "def factory():\n"
@@ -231,6 +372,8 @@ def test_entrypoint_preserves_relative_imports_and_cli(tmp_path, module_entrypoi
         "    args = parser.parse_args()\n"
         "    assert args.config_file == 'service.conf'\n"
         "    return Probe(args.output)\n"
+        "def write_output(output):\n"
+        "    Path(output).write_text(VALUE)\n"
         "if __name__ == '__main__':\n"
         "    service = hub.ReloadableProcessHubService(iter_min_period=0.05)\n"
         "    service.add_service_factory(factory)\n"
@@ -397,6 +540,77 @@ def test_failed_initial_prefork_generation_has_bounded_cleanup(tmp_path):
         timeout=10,
         env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
     )
+
+
+@pytest.mark.parametrize(
+    "pause_after", [1, 2], ids=["partial-launch", "before-readiness"]
+)
+def test_sigterm_during_cold_start_releases_listener(tmp_path, pause_after):
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    (tmp_path / "prefork_test_application.py").write_text("VERSION = 'original'\n")
+    stalled = tmp_path / "stalled"
+    stalled.mkdir()
+    (stalled / "prefork_test_application.py").write_text("VERSION = 'stalled'\n")
+    paused = tmp_path / "paused"
+    runner = tmp_path / "runner.py"
+    runner.write_text(
+        "import functools, pathlib, sys\n"
+        "from gcl_looper.services import hub\n"
+        f"from {__name__} import _factory\n"
+        "if __name__ == '__main__':\n"
+        "    service = hub.ReloadableProcessHubService(drain_timeout=0.2)\n"
+        f"    service.add_service_factory(functools.partial(_factory, {str(tmp_path)!r}, {port}))\n"
+        f"    service.add_service_factory(functools.partial(_factory, {str(stalled)!r}, 0))\n"
+        "    spawn = service._spawn\n"
+        "    launched = 0\n"
+        "    def spawn_and_pause(factory):\n"
+        "        global launched\n"
+        "        instance = spawn(factory)\n"
+        "        launched += 1\n"
+        f"        if launched == {pause_after}:\n"
+        f"            pathlib.Path({str(paused)!r}).touch()\n"
+        "            sys.stdin.buffer.read(1)\n"
+        "        return instance\n"
+        "    service._spawn = spawn_and_pause\n"
+        "    service.start()\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(runner)],
+        stdin=subprocess.PIPE,
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+    )
+
+    def listener_is_open():
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                return True
+        except OSError:
+            return False
+
+    children = []
+    try:
+        _wait(paused.exists)
+        children = psutil.Process(process.pid).children()
+        assert len(children) == pause_after
+        _wait(listener_is_open)
+        process.send_signal(signal.SIGTERM)
+        process.communicate(input=b"\n", timeout=5)
+        with socket.socket() as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", port))
+        assert process.returncode == 0
+        assert all(not child.is_running() for child in children)
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate()
+        for child in children:
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
 
 
 _BUILT_FACTORIES = []

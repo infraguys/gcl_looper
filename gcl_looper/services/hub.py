@@ -16,6 +16,7 @@
 
 import multiprocessing
 import functools
+import math
 import pickle
 import select
 import subprocess
@@ -145,7 +146,10 @@ def _run_service_factory(factory, ready):
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     initial_uid = os.getuid()
     service = factory()
-    service._ready_fd = getattr(ready, "fd", None)
+    publish_ready = ready.set
+    if isinstance(service, _PreforkGeneration):
+        service._generation_ready = ready
+        publish_ready = ready.set_prefork
     if service.__mp_downgrade_user__:
         service.add_setup(
             lambda: utils.downgrade_user_group_privileges(service.__mp_downgrade_user__)
@@ -155,7 +159,7 @@ def _run_service_factory(factory, ready):
     def setup_and_publish_ready():
         setup()
         _detach_privileged_tracker(initial_uid)
-        ready.set()
+        publish_ready()
 
     service._setup = setup_and_publish_ready
     service.start()
@@ -165,21 +169,52 @@ class _Readiness:
     def __init__(self, fd):
         self.fd = fd
         self._ready = False
+        self._lock = threading.RLock()
 
     def wait(self, timeout=None):
-        if not self._ready and self.fd is not None:
-            if select.select([self.fd], [], [], timeout)[0]:
-                self._ready = os.read(self.fd, 1) == b"R"
-                self.close()
-        return self._ready
+        deadline = None if timeout is None else time.monotonic() + timeout
+        if not self._lock.acquire(timeout=-1 if timeout is None else timeout):
+            return self._ready
+        try:
+            if not self._ready and self.fd is not None:
+                poll = select.poll()
+                poll.register(self.fd, select.POLLIN)
+                remaining = (
+                    None
+                    if deadline is None
+                    else math.ceil(max(0, deadline - time.monotonic()) * 1000)
+                )
+                if poll.poll(remaining):
+                    message = os.read(self.fd, 1)
+                    self._ready = message in (b"R", b"P")
+                    # A prefork master keeps the pipe open while its group serves.
+                    if message != b"P":
+                        self.close()
+            return self._ready
+        finally:
+            self._lock.release()
 
     def is_set(self):
         return self.wait(0)
 
+    def has_failed(self):
+        if self.fd is None:
+            return not self._ready
+        # A waiter can block in poll only until it publishes readiness.
+        if not self._ready:
+            return False
+        with self._lock:
+            if self.fd is None:
+                return False
+            poll = select.poll()
+            poll.register(self.fd, select.POLLHUP)
+            return bool(poll.poll(0))
+
     def close(self):
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
+        with self._lock:
+            if self.fd is not None:
+                os.close(self.fd)
+                self.fd = None
 
 
 class _PayloadWriter:
@@ -188,6 +223,8 @@ class _PayloadWriter:
         self.deadline = deadline
         self.stop_event = stop_event
         os.set_blocking(fd, False)
+        self._poll = select.poll()
+        self._poll.register(fd, select.POLLOUT)
 
     def write(self, data):
         pending = memoryview(data)
@@ -197,7 +234,7 @@ class _PayloadWriter:
             remaining = self.deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Generation payload transfer timed out")
-            if select.select([], [self.fd], [], min(remaining, 0.1))[1]:
+            if self._poll.poll(math.ceil(min(remaining, 0.1) * 1000)):
                 try:
                     pending = pending[os.write(self.fd, pending) :]
                 except BlockingIOError:
@@ -311,10 +348,9 @@ class _ServiceProcess(subprocess.Popen):
 
 
 def _run_prefork_worker(service, ready, master_ready_fd):
-    if master_ready_fd is not None:
-        os.close(master_ready_fd)
+    os.close(master_ready_fd)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
     _run_service_factory(lambda: service, ready)
 
 
@@ -394,14 +430,32 @@ class ReloadableProcessHubService(ProcessHubService):
                     directories.add(directory)
         # Editable packages include SDKs and plugins not imported until a request.
         for distribution in metadata.distributions():
-            direct_url = distribution.read_text("direct_url.json")
-            if direct_url:
+            try:
+                direct_url = distribution.read_text("direct_url.json")
+                if direct_url is None:
+                    continue
                 info = json.loads(direct_url)
-                url = urlsplit(info["url"])
-                if info.get("dir_info", {}).get("editable") and url.scheme == "file":
-                    directory = Path(unquote(url.path)).resolve()
+                if not isinstance(info, dict):
+                    raise ValueError("Expected an object")
+                url = info.get("url")
+                dir_info = info.get("dir_info", {})
+                if not isinstance(url, str) or not isinstance(dir_info, dict):
+                    raise ValueError("Invalid URL or directory metadata")
+                editable = dir_info.get("editable", False)
+                if not isinstance(editable, bool):
+                    raise ValueError("Invalid editable flag")
+                parsed_url = urlsplit(url)
+                if editable and parsed_url.scheme == "file":
+                    directory = Path(unquote(parsed_url.path))
+                    if not directory.is_absolute():
+                        raise ValueError("Expected an absolute file path")
                     if directory.is_dir():
-                        directories.add(directory)
+                        directories.add(directory.resolve())
+            except (ValueError, OSError, RecursionError) as error:
+                LOG.warning(
+                    "Skipping malformed or unreadable direct_url.json (%s)",
+                    type(error).__name__,
+                )
         # Keep only outer roots, avoiding repeated scans of nested packages.
         return [
             directory
@@ -439,14 +493,27 @@ class ReloadableProcessHubService(ProcessHubService):
                         sources[source] = (stat.st_mtime_ns, stat.st_size)
         return sources
 
-    def _check_source_changes(self):
+    def _check_source_changes(self, initial=False):
         if not self.autoreload:
             return
-        sources = self._snapshot_sources()
+        try:
+            if initial:
+                self._reload_dirs = self._discover_source_dirs()
+                LOG.info("Watching Python sources in %s", self._reload_dirs)
+            sources = self._snapshot_sources()
+        except OSError:
+            LOG.exception(
+                "Autoreload disabled after a watcher error; services keep running"
+            )
+            self.autoreload = False
+            self._reload_dirs = []
+            self._sources = {}
+            return
         if sources != self._sources:
             self._sources = sources
-            LOG.info("Source changes detected, reloading services")
-            self.reload()
+            if not initial:
+                LOG.info("Source changes detected, reloading services")
+                self.reload()
 
     def add_service(self, service):
         raise TypeError(
@@ -482,6 +549,8 @@ class ReloadableProcessHubService(ProcessHubService):
         generation = {}
         try:
             for index, factories in enumerate(groups.values()):
+                if self._stop_event.is_set():
+                    raise InterruptedError("Hub stopped during generation startup")
                 generation[index] = self._spawn(
                     functools.partial(_build_generation, factories, self._drain_timeout)
                 )
@@ -491,16 +560,27 @@ class ReloadableProcessHubService(ProcessHubService):
         return generation
 
     def _setup(self):
-        # Installed here rather than with the base signal handlers, which come
-        # after the setup: spawning takes a while, and until then SIGHUP would
-        # kill the hub instead of reloading it.
         if self.should_subscribe_signals:
-            signal.signal(signal.SIGHUP, lambda s, frame: self.reload())
-        if self.autoreload:
-            self._reload_dirs = self._discover_source_dirs()
-            LOG.info("Watching Python sources in %s", self._reload_dirs)
-            self._sources = self._snapshot_sources()
-        self._instances = self._spawn_generation()
+            handlers = self._get_sig_handlers()
+            handlers[signal.SIGHUP] = lambda s, frame: self.reload()
+            self._subscribe_signals(handlers)
+        self._check_source_changes(initial=True)
+        try:
+            self._instances = self._spawn_generation()
+        except InterruptedError:
+            if not self._stop_event.is_set():
+                raise
+
+    def _starting_group_failed(self, instance):
+        exitcode = instance.exitcode
+        if exitcode is None and not instance.ready.has_failed():
+            return False
+        LOG.error(
+            "New generation group(pid:%i) failed before cutover, exit code %r",
+            instance.pid,
+            exitcode,
+        )
+        return True
 
     def _wait_ready(self, generation):
         deadline = self._ready_deadline
@@ -508,12 +588,9 @@ class ReloadableProcessHubService(ProcessHubService):
             deadline = time.monotonic() + self._ready_timeout
         for instance in generation.values():
             while not instance.ready.wait(timeout=0.1):
-                if not instance.is_alive():
-                    LOG.error(
-                        "New worker(pid:%i) exited with code %r before becoming ready",
-                        instance.pid,
-                        instance.exitcode,
-                    )
+                if any(
+                    self._starting_group_failed(group) for group in generation.values()
+                ):
                     return False
                 if not self._enabled:
                     return False
@@ -524,15 +601,10 @@ class ReloadableProcessHubService(ProcessHubService):
                         self._ready_timeout,
                     )
                     return False
-        for instance in generation.values():
-            if not instance.is_alive():
-                LOG.error(
-                    "New worker(pid:%i) exited with code %r before the generation was ready",
-                    instance.pid,
-                    instance.exitcode,
-                )
-                return False
-        return self._enabled
+        return (
+            not any(self._starting_group_failed(group) for group in generation.values())
+            and self._enabled
+        )
 
     def _drain(self, instances):
         """SIGTERM the workers, kill the ones still alive after drain_timeout."""
@@ -586,20 +658,16 @@ class ReloadableProcessHubService(ProcessHubService):
         self._drain(old.values())
 
     def _iteration(self):
+        # Keep a stop requested in setup across BasicService._loop's reset.
+        if self._stop_deadline is not None:
+            self.stop()
+            return
         if not self._initial_ready:
             self._initial_ready = True
             if not self._wait_ready(self._instances):
                 self.stop()
                 return
-        try:
-            self._check_source_changes()
-        except OSError:
-            LOG.exception(
-                "Autoreload disabled after a watcher error; services keep running"
-            )
-            self.autoreload = False
-            self._reload_dirs = []
-            self._sources = {}
+        self._check_source_changes()
         if self._reload_requested and self._enabled:
             self._reload()
         super()._iteration()
@@ -624,15 +692,15 @@ class _PreforkGeneration(ReloadableProcessHubService):
     def _setup(self):
         self._subscribe_signals(self._get_sig_handlers())
         context = multiprocessing.get_context("fork")
-        for service in self._services:
+        for index, service in enumerate(self._services):
             ready = context.Event()
             instance = context.Process(
                 target=_run_prefork_worker,
-                args=(service, ready, self._ready_fd),
+                args=(service, ready, self._generation_ready.fd),
             )
             instance.ready = ready
-            self._instances[service] = instance
             instance.start()
+            self._instances[index] = instance
         while not all(i.ready.is_set() for i in self._instances.values()):
             if self._stop_event.is_set():
                 raise InterruptedError("Prefork generation stopped during setup")
@@ -641,3 +709,8 @@ class _PreforkGeneration(ReloadableProcessHubService):
             time.sleep(0.05)
         if any(not i.is_alive() for i in self._instances.values()):
             raise RuntimeError("Prefork worker exited before readiness")
+        self._initial_ready = True
+
+    def _finish(self):
+        self._generation_ready.close()
+        super()._finish()
