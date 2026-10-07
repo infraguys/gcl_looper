@@ -165,21 +165,24 @@ class _Readiness:
     def __init__(self, fd):
         self.fd = fd
         self._ready = False
+        self._lock = threading.RLock()
 
     def wait(self, timeout=None):
-        if not self._ready and self.fd is not None:
-            if select.select([self.fd], [], [], timeout)[0]:
-                self._ready = os.read(self.fd, 1) == b"R"
-                self.close()
-        return self._ready
+        with self._lock:
+            if not self._ready and self.fd is not None:
+                if select.select([self.fd], [], [], timeout)[0]:
+                    self._ready = os.read(self.fd, 1) == b"R"
+                    self.close()
+            return self._ready
 
     def is_set(self):
         return self.wait(0)
 
     def close(self):
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
+        with self._lock:
+            if self.fd is not None:
+                os.close(self.fd)
+                self.fd = None
 
 
 class _PayloadWriter:

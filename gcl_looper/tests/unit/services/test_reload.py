@@ -15,9 +15,11 @@
 #    under the License.
 
 from unittest import mock
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import sys
+import threading
 import types
 
 import pytest
@@ -34,6 +36,38 @@ def test_readiness_pipe_closes_on_success_or_eof():
         assert ready.wait(0.1) == bool(message)
         assert ready.fd is None
         assert ready.is_set() == bool(message)
+
+
+def test_readiness_pipe_preserves_signal_for_concurrent_waiters(monkeypatch):
+    read_fd, write_fd = os.pipe()
+    ready = hub._Readiness(read_fd)
+    os.write(write_fd, b"R")
+    os.close(write_fd)
+    waiters = threading.Barrier(2)
+    reading = threading.Barrier(2)
+    select_readiness = hub.select.select
+
+    def simultaneous_select(*args):
+        result = select_readiness(*args)
+        try:
+            reading.wait(timeout=1)
+        except threading.BrokenBarrierError:
+            pass
+        return result
+
+    def wait():
+        waiters.wait(timeout=5)
+        return ready.wait(1)
+
+    monkeypatch.setattr(hub.select, "select", simultaneous_select)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = [executor.submit(wait) for _ in range(2)]
+            assert [result.result(timeout=5) for result in results] == [True, True]
+        assert ready.fd is None
+        assert ready.is_set()
+    finally:
+        ready.close()
 
 
 def test_worker_exiting_while_peer_starts_rejects_reload():
