@@ -202,7 +202,10 @@ def test_add_service_is_rejected():
 
 def test_sighup_reloads_while_workers_spawn():
     h = hub.ReloadableProcessHubService()
-    original = signal.getsignal(signal.SIGHUP)
+    original = {
+        sig: signal.getsignal(sig)
+        for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGCHLD)
+    }
     try:
         h._setup()
 
@@ -210,7 +213,8 @@ def test_sighup_reloads_while_workers_spawn():
 
         assert h._reload_requested
     finally:
-        signal.signal(signal.SIGHUP, original)
+        for sig, handler in original.items():
+            signal.signal(sig, handler)
 
 
 def test_stop_racing_a_reload_leaves_no_workers(running_hub):

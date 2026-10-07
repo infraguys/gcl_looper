@@ -15,9 +15,15 @@
 #    under the License.
 
 from unittest import mock
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
+import fcntl
 import json
 import os
+import resource
 import sys
+import threading
+import time
 import types
 
 import pytest
@@ -32,21 +38,165 @@ def test_readiness_pipe_closes_on_success_or_eof():
         os.write(write_fd, message)
         os.close(write_fd)
         assert ready.wait(0.1) == bool(message)
+        assert ready.has_failed() == (not message)
         assert ready.fd is None
         assert ready.is_set() == bool(message)
+
+
+def test_prefork_readiness_pipe_reports_shutdown_after_ready():
+    read_fd, write_fd = os.pipe()
+    ready = hub._Readiness(read_fd)
+    try:
+        with os.fdopen(write_fd, "wb", buffering=0) as status:
+            status.write(b"P")
+            assert ready.wait(0.1)
+            assert not ready.has_failed()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with ready._lock:
+                check = executor.submit(ready.has_failed)
+                with pytest.raises(FutureTimeoutError):
+                    check.result(timeout=0.05)
+            assert check.result(timeout=5)
+        assert ready.is_set()
+    finally:
+        ready.close()
+
+
+@pytest.mark.parametrize("direction", ["readiness", "payload"])
+def test_pipe_wait_supports_high_fds(direction, monkeypatch):
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard <= 1024:
+        pytest.skip("A descriptor above FD_SETSIZE requires a higher hard limit")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 1025), hard))
+    read_fd, write_fd = os.pipe()
+    high_fd = None
+    ready = None
+    create_poll = hub.select.poll
+
+    class IntegerTimeoutPoll:
+        def __init__(self):
+            self.poller = create_poll()
+
+        def register(self, *args):
+            self.poller.register(*args)
+
+        def poll(self, timeout):
+            assert isinstance(timeout, int)
+            return self.poller.poll(timeout)
+
+    monkeypatch.setattr(hub.select, "poll", IntegerTimeoutPoll)
+    try:
+        high_fd = fcntl.fcntl(
+            read_fd if direction == "readiness" else write_fd, fcntl.F_DUPFD, 1024
+        )
+        if direction == "readiness":
+            ready = hub._Readiness(high_fd)
+            os.write(write_fd, b"R")
+            assert ready.wait(1)
+        else:
+            writer = hub._PayloadWriter(high_fd, time.monotonic() + 1, None)
+            assert writer.write(b"payload") == 7
+            assert os.read(read_fd, 7) == b"payload"
+    finally:
+        if ready is not None:
+            ready.close()
+        elif high_fd is not None:
+            os.close(high_fd)
+        os.close(read_fd)
+        os.close(write_fd)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+def test_readiness_pipe_preserves_signal_for_concurrent_waiters(monkeypatch):
+    read_fd, write_fd = os.pipe()
+    ready = hub._Readiness(read_fd)
+    os.write(write_fd, b"R")
+    os.close(write_fd)
+    waiters = threading.Barrier(2)
+    reading = threading.Barrier(2)
+    poll_readiness = hub.select.poll
+
+    class ConcurrentPoll:
+        def __init__(self):
+            self.poller = poll_readiness()
+
+        def register(self, *args):
+            self.poller.register(*args)
+
+        def poll(self, timeout):
+            result = self.poller.poll(timeout)
+            try:
+                reading.wait(timeout=0.1)
+            except threading.BrokenBarrierError:
+                pass
+            return result
+
+    def wait():
+        waiters.wait(timeout=5)
+        return ready.wait(1)
+
+    monkeypatch.setattr(hub.select, "poll", ConcurrentPoll)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = [executor.submit(wait) for _ in range(2)]
+            assert [result.result(timeout=5) for result in results] == [True, True]
+        assert ready.fd is None
+        assert ready.is_set()
+    finally:
+        ready.close()
+
+
+@pytest.mark.parametrize("timeout", [0, 0.05])
+def test_readiness_timeout_includes_concurrent_wait(timeout, monkeypatch):
+    read_fd, write_fd = os.pipe()
+    ready = hub._Readiness(read_fd)
+    waiting = threading.Event()
+    poll_readiness = hub.select.poll
+
+    class NotifyingPoll:
+        def __init__(self):
+            self.poller = poll_readiness()
+
+        def register(self, *args):
+            self.poller.register(*args)
+
+        def poll(self, timeout):
+            waiting.set()
+            return self.poller.poll(timeout)
+
+    monkeypatch.setattr(hub.select, "poll", NotifyingPoll)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            waiter = executor.submit(ready.wait)
+            try:
+                assert waiting.wait(5)
+                check = executor.submit(
+                    ready.is_set if timeout == 0 else ready.wait,
+                    *(() if timeout == 0 else (timeout,)),
+                )
+                assert check.result(timeout=0.5) is False
+                assert executor.submit(ready.has_failed).result(timeout=0.5) is False
+            finally:
+                os.write(write_fd, b"R")
+                assert waiter.result(timeout=5)
+    finally:
+        ready.close()
+        os.close(write_fd)
 
 
 def test_worker_exiting_while_peer_starts_rejects_reload():
     service = hub.ReloadableProcessHubService()
     service._enabled = True
-    old = mock.Mock()
+    old = mock.Mock(exitcode=None)
+    old.ready.has_failed.return_value = False
     service._instances = {0: old}
-    first, second = mock.Mock(pid=1, exitcode=1), mock.Mock(pid=2)
+    first, second = mock.Mock(pid=1, exitcode=None), mock.Mock(pid=2, exitcode=None)
     first.ready.wait.return_value = True
-    first.is_alive.return_value = True
+    first.ready.has_failed.return_value = False
+    second.ready.has_failed.return_value = False
 
     def peer_ready(timeout):
-        first.is_alive.return_value = False
+        first.exitcode = 1
         return True
 
     second.ready.wait.side_effect = peer_ready
@@ -102,7 +252,8 @@ def test_payload_transfer_and_readiness_share_startup_deadline():
     service.add_service_factory(os.getpid)
     service.add_service_factory(os.getuid)
     clock = [0.0]
-    instance = mock.Mock(pid=1)
+    instance = mock.Mock(pid=1, exitcode=None)
+    instance.ready.has_failed.return_value = False
 
     def spawn(factory):
         assert service._ready_deadline == 10
@@ -170,6 +321,29 @@ def test_source_watch_failure_disables_watcher_and_keeps_serving(tmp_path, monke
     service._reload.assert_called_once()
 
 
+def test_initial_source_watch_failure_still_launches_services(tmp_path, monkeypatch):
+    service = hub.ReloadableProcessHubService(autoreload=True, reload_dirs=[tmp_path])
+    service.should_subscribe_signals = False
+    service._discover_source_dirs = mock.Mock(return_value=[tmp_path])
+    instance = mock.Mock(exitcode=None)
+    instance.ready.wait.return_value = True
+    instance.ready.has_failed.return_value = False
+    service._spawn_generation = mock.Mock(return_value={0: instance})
+    monkeypatch.setattr(
+        hub.os, "scandir", mock.Mock(side_effect=PermissionError("unreadable source"))
+    )
+    service._setup()
+    service._spawn_generation.assert_called_once()
+    assert service._instances
+    assert not service.autoreload
+    assert service._load_source
+    service._reload = mock.Mock()
+    service._enabled = True
+    service.reload()
+    service._iteration()
+    service._reload.assert_called_once()
+
+
 def test_autoreload_discovers_modules_and_lazy_editable_projects(tmp_path, monkeypatch):
     from importlib import metadata
 
@@ -190,6 +364,47 @@ def test_autoreload_discovers_modules_and_lazy_editable_projects(tmp_path, monke
     assert sdk in directories
     assert plugin in directories
     assert "lazy_plugin" not in sys.modules
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "{",
+        "[]",
+        '{"url": 3}',
+        '{"url": "", "dir_info": null}',
+        '{"url": "file:", "dir_info": {"editable": true}}',
+    ],
+)
+def test_autoreload_skips_malformed_package_metadata(
+    tmp_path, monkeypatch, caplog, malformed
+):
+    from importlib import metadata
+
+    packages = tmp_path / "site-packages"
+    broken = packages / "broken-1.0.dist-info"
+    broken.mkdir(parents=True)
+    (broken / "direct_url.json").write_text(malformed)
+    editable = packages / "editable-1.0.dist-info"
+    editable.mkdir()
+    source = tmp_path / "editable"
+    source.mkdir()
+    (editable / "direct_url.json").write_text(
+        json.dumps({"url": source.as_uri(), "dir_info": {"editable": True}})
+    )
+    distributions = list(metadata.distributions(path=[str(packages)]))
+    distributions.sort(key=lambda dist: dist.read_text("direct_url.json") != malformed)
+    monkeypatch.setattr(metadata, "distributions", lambda: distributions)
+    service = hub.ReloadableProcessHubService(autoreload=True)
+    service.should_subscribe_signals = False
+    service._spawn_generation = mock.Mock(return_value={})
+
+    service._setup()
+
+    service._spawn_generation.assert_called_once()
+    assert service.autoreload
+    assert source in service._reload_dirs
+    assert "Skipping malformed or unreadable direct_url.json" in caplog.text
 
 
 def test_production_does_not_discover_or_scan_sources():

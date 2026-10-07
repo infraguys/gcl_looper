@@ -24,10 +24,19 @@ from gcl_looper.services import hub
 class _Ready:
     def __init__(self, fd):
         self.fd = fd
+        os.set_inheritable(fd, False)
 
     def set(self):
         os.write(self.fd, b"R")
-        os.close(self.fd)
+        self.close()
+
+    def set_prefork(self):
+        os.write(self.fd, b"P")
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
 
 
 def main():
@@ -44,14 +53,14 @@ def main():
     if main_module == "__main__" or (main_module and main_module.endswith(".__main__")):
         main_module = main_path = None
     if main_module or (main_path and os.path.isfile(main_path)):
-        module = types.ModuleType("__service_main__")
+        module = types.ModuleType("__mp_main__")
         namespace = (
-            runpy.run_module(main_module, run_name="__service_main__", alter_sys=True)
+            runpy.run_module(main_module, run_name="__mp_main__", alter_sys=True)
             if main_module
-            else runpy.run_path(main_path, run_name="__service_main__")
+            else runpy.run_path(main_path, run_name="__mp_main__")
         )
         module.__dict__.update(namespace)
-        sys.modules["__main__"] = sys.modules["__service_main__"] = module
+        sys.modules["__main__"] = sys.modules["__mp_main__"] = module
     factory = pickle.loads(factory_data)
     hub._run_service_factory(factory, ready)
 
