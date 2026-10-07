@@ -239,29 +239,58 @@ utils.downgrade_user_group_privileges("nobody")
 
 ### Reloadable Process Hub service
 
-`ReloadableProcessHubService` replaces its workers on `SIGHUP` without downtime, e.g. to serve an upgraded package. Workers are built by factories in fresh interpreters (`spawn`), so they load the code currently on disk. A new generation starts next to the old one and the old one drains only after every new worker is ready; if a new worker fails, the old generation keeps serving. `BjoernService` binds its socket before running setup callbacks and starts listening only after they succeed. Readiness is published after the complete service setup. Spawn workers that drop root privileges detach from the parent resource tracker; any tracker they subsequently need runs under their own UID. Filesystem Unix sockets require Linux `/proc/self/fd`: binding and cleanup use pinned directory descriptors so renaming a parent directory cannot redirect cleanup. Cleanup removes the entry only if it still identifies the socket created by the service.
+`ReloadableProcessHubService` supervises service generations. Each generation
+starts in a fresh interpreter via `subprocess`/`exec`, preloads its factory-built
+services and forks workers to share application memory through copy-on-write.
+Identical serialized factories share a master; different factories use separate
+interpreters so their workers do not inherit each other's application state.
+Replicas sharing a master must use the same `__mp_downgrade_user__`.
+With one worker the service runs directly, without an intermediate master.
+Readiness uses a pipe; the hub starts no multiprocessing resource tracker.
+Factory payloads travel through a separate stdin pipe, closed before application
+code runs. Child interpreters preserve the supervisor's Python isolation flags
+and import paths. Payload transfer and worker readiness share `ready_timeout`;
+`stop()` interrupts a blocked transfer.
 
-* A factory is a picklable callable (module-level function or its `functools.partial`) returning a service; it runs in the worker, so it parses config and configures logging itself.
-* Both generations must share the listening address: `BjoernService` with `reuse_port=True`.
-* Set `net.ipv4.tcp_migrate_req=1` (Linux 5.14+) so connections queued on a closing listener move to a live one.
-* `ready_timeout` bounds the start of a new generation, `drain_timeout` the drain of an old one. bjoern keeps serving open keep-alive connections while draining, so behind a keep-alive client the old worker is killed at `drain_timeout`.
+On `SIGHUP` or `reload()`, a new generation starts beside the old one. Only after
+all new workers finish setup does the old master receive `SIGTERM`. If startup
+fails or exceeds `ready_timeout`, the old generation keeps serving. After
+`drain_timeout`, remaining processes in the old generation's group are killed.
+
+* Factories are picklable module-level callables or `functools.partial` objects.
+  They run in the generation master and must remain single-threaded and
+  fork-safe. Parse config and configure logging there; open connections and
+  start background threads in worker setup callbacks.
+* Both generations must share the listening address: TCP `BjoernService`
+  workers need `reuse_port=True`.
+* Set `net.ipv4.tcp_migrate_req=1` (Linux 5.14+) to migrate connections queued on
+  a closing listener to a live one.
+* Bjoern keeps serving open keep-alive connections while draining. Such a worker
+  may be killed at `drain_timeout`, potentially resetting an in-flight request.
+* `BjoernService` binds before setup callbacks and listens only after they
+  succeed. Filesystem Unix socket cleanup uses pinned directory descriptors and
+  removes only the socket created by that service; overlapping generations on
+  the same filesystem Unix socket path are not supported.
 
 ```python
 import functools
 import sys
 
-from gcl_looper.services import bjoern_service
-from gcl_looper.services import hub
+from gcl_looper.services import bjoern_service, hub
 
 
 def build_worker(argv):
     parse_config(argv)
-    return bjoern_service.BjoernService(
-        wsgi_app=build_app(),
+    app = build_app()
+    service = bjoern_service.BjoernService(
+        wsgi_app=app,
         host="0.0.0.0",
         port=8080,
         bjoern_kwargs=dict(reuse_port=True),
     )
+    # Open database connections in this callback, after fork and before readiness.
+    service.add_setup(app.open_connections)
+    return service
 
 
 def main():
@@ -271,10 +300,25 @@ def main():
     serv_hub.start()
 
 
-if __name__ == "__main__":  # required by the spawn start method
+if __name__ == "__main__":
     main()
 ```
 
+Use the same hub in dev and production. Set `autoreload=True` for development;
+no paths are required. The supervisor discovers local imported source directories
+and installed editable projects, including SDKs and plugins imported only on a
+request. System Python directories are excluded. Use `reload_dirs` only to add
+other source directories. Hidden directories, virtual environments, build outputs
+and bytecode caches are skipped.
+
+The supervisor polls `.py` timestamps with nanosecond precision once per hub
+iteration (one second by default), replacing generations on edits, additions or
+deletions. Development generations compile Python source directly, bypassing
+bytecode caches (including `PYTHONPYCACHEPREFIX`); cached files are left untouched.
+A filesystem scan error disables autoreload and keeps the current services running;
+manual reload remains available and continues compiling source directly.
+Autoreload uses only the standard library and starts no threads or processes;
+`autoreload=False` (the default) disables discovery and scanning in production.
 With systemd: `ExecReload=/bin/kill -HUP $MAINPID`, then `systemctl reload <unit>`.
 
 ### Launchpad Service
