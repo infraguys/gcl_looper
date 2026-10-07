@@ -96,6 +96,31 @@ def test_stop_during_drain_shares_deadline_between_generations():
     new.kill.assert_called_once()
 
 
+def test_payload_transfer_and_readiness_share_startup_deadline():
+    service = hub.ReloadableProcessHubService(ready_timeout=10)
+    service._enabled = True
+    service.add_service_factory(os.getpid)
+    service.add_service_factory(os.getuid)
+    clock = [0.0]
+    instance = mock.Mock(pid=1)
+
+    def spawn(factory):
+        assert service._ready_deadline == 10
+        clock[0] += 3
+        return instance
+
+    def wait(timeout):
+        clock[0] += timeout
+        return False
+
+    instance.ready.wait.side_effect = wait
+    service._spawn = mock.Mock(side_effect=spawn)
+    with mock.patch.object(hub.time, "monotonic", side_effect=lambda: clock[0]):
+        generation = service._spawn_generation()
+        assert not service._wait_ready(generation)
+    assert 10 <= clock[0] < 10.2
+
+
 def test_source_watch_detects_subsecond_edits_creation_and_deletion(tmp_path):
     source = tmp_path / "service.py"
     source.write_text("VERSION = 1\n")
