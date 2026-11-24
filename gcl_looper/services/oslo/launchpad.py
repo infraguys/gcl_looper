@@ -21,11 +21,15 @@ import typing as tp
 
 from oslo_config import cfg
 
+from gcl_looper import constants as c
 from gcl_looper import utils
 from gcl_looper import version
-from gcl_looper import constants as c
+from gcl_looper.election import config as election_config
 from gcl_looper.services import basic
 from gcl_looper.services.oslo import base as oslo_base
+
+if tp.TYPE_CHECKING:
+    from gcl_looper.election import base as elector_base
 
 LOG = logging.getLogger(__name__)
 DOMAIN = "launchpad"
@@ -57,8 +61,16 @@ class LaunchpadService(basic.BasicService, oslo_base.OsloConfigurableService):
         services: tp.Collection[basic.BasicService],
         iter_min_period: float = 1,
         iter_pause: float = 0.1,
+        elector: tp.Optional[elector_base.LeaderElector] = None,
     ):
-        super().__init__(iter_min_period, iter_pause)
+        if elector is not None and any(
+            getattr(service, "_elector", None) is not None for service in services
+        ):
+            raise ValueError(
+                "Configure leader election either for the launchpad or its "
+                "services, not both"
+            )
+        super().__init__(iter_min_period, iter_pause, elector=elector)
         self._services = services
         for service in self._services:
             if isinstance(service, basic.BoostableServiceMixin):
@@ -68,6 +80,28 @@ class LaunchpadService(basic.BasicService, oslo_base.OsloConfigurableService):
         LOG.info("Setup all services")
         for service in self._services:
             service._setup()
+
+    def _finish(self) -> None:
+        # Inner leadership must be released before the launchpad lock. This
+        # keeps the inner election teardown inside the outer ownership scope.
+        for service in self._services:
+            inner_elector = getattr(service, "_elector", None)
+            if inner_elector is not None:
+                try:
+                    service._release_master()
+                except Exception:
+                    LOG.exception(
+                        "Failed to demote %s",
+                        service.__class__.__name__,
+                    )
+                try:
+                    inner_elector.close()
+                except Exception:
+                    LOG.exception(
+                        "Failed to close the elector of %s",
+                        service.__class__.__name__,
+                    )
+        super()._finish()
 
     def _iteration(self):
         # Iterate all services
@@ -196,6 +230,11 @@ class LaunchpadService(basic.BasicService, oslo_base.OsloConfigurableService):
                     "refused. Requires ``boost_max_iterations`` to be set."
                 ),
             ),
+            # Master election for the whole launchpad. When several
+            # launchpads run on different nodes, only the one holding the
+            # lock iterates its services (unless the inner services
+            # configure their own electors).
+            *election_config.get_config_opts(),
         ]
 
     @classmethod
@@ -283,11 +322,28 @@ class LaunchpadService(basic.BasicService, oslo_base.OsloConfigurableService):
                 services.append(svc)
             LOG.info("Service %s loaded, %d instance(s)", svc_name, count)
 
+        # Master election for the launchpad itself (optional)
+        elector = election_config.build_elector(
+            backend=launchpad_cfg[DOMAIN].election_backend,
+            connection_url=launchpad_cfg[DOMAIN].election_connection_url,
+            lock_key=launchpad_cfg[DOMAIN].election_lock_key,
+            refresh_interval=launchpad_cfg[DOMAIN].election_refresh_interval,
+            lock_timeout=launchpad_cfg[DOMAIN].election_lock_timeout,
+            table_name=launchpad_cfg[DOMAIN].election_table_name,
+            create_table=launchpad_cfg[DOMAIN].election_create_table,
+        )
+        if elector is not None:
+            LOG.info(
+                "Master election enabled for the launchpad: %r",
+                elector,
+            )
+
         # Create global service
         launchpad_service = cls(
             services=services,
             iter_min_period=launchpad_cfg[DOMAIN].iter_min_period,
             iter_pause=launchpad_cfg[DOMAIN].iter_pause,
+            elector=elector,
         )
 
         # Configure boost overheat protection if any of the options is set.

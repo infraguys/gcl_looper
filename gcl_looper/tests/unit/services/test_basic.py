@@ -158,6 +158,5 @@ class TestBasicService:
             "iter_min_period — loop thread still running after 2s"
         )
         assert elapsed < 1.0, (
-            "stop() from _iteration() took %.2fs to exit — "
-            "expected under 1s" % elapsed
+            "stop() from _iteration() took %.2fs to exit — expected under 1s" % elapsed
         )
