@@ -12,6 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+from concurrent.futures import Future
 import functools
 import importlib
 import json
@@ -85,7 +86,17 @@ def api(tmp_path, request):
         service.add_service_factory(
             functools.partial(_factory_with_finish, tmp_path, port)
         )
-    thread = threading.Thread(target=service.start)
+    result = Future()
+
+    def supervise():
+        try:
+            service.start()
+        except RuntimeError as error:
+            result.set_exception(error)
+        else:
+            result.set_result(None)
+
+    thread = threading.Thread(target=supervise)
     thread.start()
     try:
         _wait(
@@ -94,7 +105,7 @@ def api(tmp_path, request):
                 and all(i.ready.is_set() for i in service._instances.values())
             )
         )
-        yield service, source, port
+        yield service, source, port, result
     finally:
         service.stop()
         thread.join(timeout=5)
@@ -111,7 +122,7 @@ def _get(port):
 
 
 def test_fork_workers_and_reload_changed_module(api):
-    service, source, port = api
+    service, source, port, _ = api
     master = service._instances[0]
     responses = [_get(port) for _ in range(40)]
     assert {r[0] for r in responses} == {"original"}
@@ -135,7 +146,7 @@ def test_fork_workers_and_reload_changed_module(api):
     ["invalid python!", "VERSION = 'stalled'\n", "VERSION = 'failed_setup'\n"],
 )
 def test_failed_generation_keeps_old_workers(api, code):
-    service, source, port = api
+    service, source, port, _ = api
     master = service._instances[0]
     finished = threading.Event()
     reload_generation = service._reload
@@ -156,7 +167,7 @@ def test_failed_generation_keeps_old_workers(api, code):
 
 
 def test_bjoern_runs_finishes_on_reload_and_shutdown(api):
-    service, source, port = api
+    service, source, port, _ = api
 
     def serving_workers(master, version):
         children = psutil.Process(master.pid).children()
@@ -281,7 +292,7 @@ def test_prefork_tracks_all_equal_service_instances(tmp_path, factory):
 
 
 def test_dead_master_cleans_up_workers(api):
-    service, _, port = api
+    service, _, port, result = api
     workers = {int(_get(port)[1]) for _ in range(40)}
     os.kill(service._instances[0].pid, signal.SIGKILL)
     _wait(lambda: not service._enabled)
@@ -294,10 +305,12 @@ def test_dead_master_cleans_up_workers(api):
             return True
 
     _wait(lambda: all(stopped(pid) for pid in workers))
+    with pytest.raises(RuntimeError, match="Child service .* exited with code -9"):
+        result.result(timeout=5)
 
 
 def test_stop_during_reload(api):
-    service, source, _ = api
+    service, source, _, _ = api
     spawning = threading.Event()
     spawn = service._spawn_generation
 
@@ -317,7 +330,7 @@ def test_stop_during_reload(api):
 
 
 def test_no_resource_tracker_or_extra_master(api):
-    service, _, port = api
+    service, _, port, _ = api
     master = service._instances[0]
     children = psutil.Process(master.pid).children(recursive=True)
     single_worker = int(_get(port)[1]) == master.pid
@@ -326,7 +339,7 @@ def test_no_resource_tracker_or_extra_master(api):
 
 
 def test_reload_closes_readiness_descriptors(api):
-    service, source, port = api
+    service, source, port, _ = api
     before = len(os.listdir("/proc/self/fd"))
     for version in ("another_application", "third_application_generation"):
         old = service._instances[0]
@@ -534,12 +547,16 @@ def test_failed_initial_prefork_generation_has_bounded_cleanup(tmp_path):
         "    service.add_service_factory(factory)\n"
         "    service.start()\n"
     )
-    subprocess.run(
+    process = subprocess.run(
         [sys.executable, str(runner)],
-        check=True,
+        check=False,
+        capture_output=True,
+        text=True,
         timeout=10,
         env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
     )
+    assert process.returncode == 1
+    assert "Initial worker generation did not become ready" in process.stderr
 
 
 @pytest.mark.parametrize(
@@ -622,9 +639,10 @@ class _SnapshotProbe(bjoern_service.base.AbstractService):
         self.output = output
 
     def _loop(self):
-        from pathlib import Path
-
-        (Path(self.output) / str(os.getpid())).write_text(json.dumps(_BUILT_FACTORIES))
+        snapshot = Path(self.output) / f"{os.getpid()}.json"
+        pending = snapshot.with_suffix(".tmp")
+        pending.write_text(json.dumps(_BUILT_FACTORIES))
+        pending.replace(snapshot)
         time.sleep(60)
 
     def stop(self):
@@ -646,8 +664,8 @@ def test_different_factories_have_isolated_prefork_state(tmp_path):
     try:
         assert len(instances) == 2
         assert all(instance.ready.wait(10) for instance in instances.values())
-        _wait(lambda: len(list(tmp_path.iterdir())) == 3)
-        snapshots = [json.loads(path.read_text()) for path in tmp_path.iterdir()]
+        _wait(lambda: len(list(tmp_path.glob("*.json"))) == 3)
+        snapshots = [json.loads(path.read_text()) for path in tmp_path.glob("*.json")]
         assert snapshots.count(["first", "first"]) == 2
         assert snapshots.count(["second"]) == 1
     finally:
@@ -695,7 +713,7 @@ def test_factory_payload_can_exceed_pipe_capacity(tmp_path):
     )
     try:
         assert process.ready.wait(10)
-        output = tmp_path / str(process.pid)
+        output = tmp_path / f"{process.pid}.json"
         _wait(lambda: output.exists() and output.stat().st_size > len(identity))
         assert json.loads(output.read_text()) == [identity]
     finally:
@@ -706,7 +724,7 @@ def test_factory_payload_can_exceed_pipe_capacity(tmp_path):
 def test_blocked_payload_write_is_bounded_and_cleans_up(
     api, tmp_path, monkeypatch, cancel
 ):
-    service, _, port = api
+    service, _, port, _ = api
     old = service._instances[0]
     service._ready_timeout = 60 if cancel else 0.3
     service._factories = [

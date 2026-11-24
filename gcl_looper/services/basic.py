@@ -477,7 +477,7 @@ class BasicService(BoostableServiceMixin, base.AbstractService):
                 # after the clear picks up the new values. A wake that
                 # arrives after the clear is not erased and will be
                 # handled on the next loop pass.
-                self._wake_event.clear()
+                self._clear_iteration_wake()
                 # Schedule the next run using pacing effective after the
                 # iteration, which may change or expire the boost.
                 pacing = self._current_pacing()
@@ -489,6 +489,9 @@ class BasicService(BoostableServiceMixin, base.AbstractService):
                 self._wake_event.wait(
                     timeout=max(time_to_sleep, pacing.iter_pause),
                 )
+
+    def _clear_iteration_wake(self):
+        self._wake_event.clear()
 
     @abc.abstractmethod
     def _iteration(self):

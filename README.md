@@ -257,6 +257,19 @@ all new workers finish setup does the old master receive `SIGTERM`. If startup
 fails or exceeds `ready_timeout`, the old generation keeps serving. After
 `drain_timeout`, remaining processes in the old generation's group are killed.
 
+`reload()` returns a `concurrent.futures.Future` that resolves to `True` after a
+successful replacement or `False` on failure or shutdown. Requests queued before
+the same replacement share its result. A request arriving during replacement
+gets the result of a later generation.
+
+Register singleton services with `add_background_service_factory(factory)`.
+Each factory starts once in its own interpreter and is supervised alongside
+the worker generation. If a child exits unexpectedly or initial readiness
+fails, `start()` raises after cleaning up the children. Workers that finish
+normally after readiness can stop the hub successfully. Set
+`allow_clean_worker_exit=False` for long-running servers that must treat any
+worker exit as a failure. Background services must run until shutdown.
+
 * Factories are picklable module-level callables or `functools.partial` objects.
   They run in the generation master and must remain single-threaded and
   fork-safe. Parse config and configure logging there; open connections and
@@ -319,7 +332,26 @@ A filesystem scan error disables autoreload and keeps the current services runni
 manual reload remains available and continues compiling source directly.
 Autoreload uses only the standard library and starts no threads or processes;
 `autoreload=False` (the default) disables discovery and scanning in production.
-With systemd: `ExecReload=/bin/kill -HUP $MAINPID`, then `systemctl reload <unit>`.
+With systemd, `ExecReload=/bin/kill -HUP $MAINPID` requests reload asynchronously.
+For a synchronous result, pass `reload_socket=reload_control.systemd_socket_path()`
+to the hub, importing `reload_control` from `gcl_looper.services`. Configure one
+private runtime directory for the unit and point `ExecReload` at the same Python
+environment as the service.
+
+```ini
+[Service]
+RuntimeDirectory=my-service
+RuntimeDirectoryMode=0700
+TimeoutStartSec=130
+ExecReload=/path/to/venv/bin/python -m gcl_looper.services.reload_control
+```
+
+The command waits for up to 125 seconds and exits unsuccessfully if the hub
+cannot complete the replacement. `request_reload(path, timeout=...)` offers the
+same result to Python callers. The socket uses mode `0600` and its parent
+directory must be writable only by trusted users. The hub uses an adjacent
+`reload.sock.lock` file to coordinate ownership and reclaim stale sockets after
+an unclean shutdown.
 
 ### Launchpad Service
 

@@ -21,6 +21,8 @@ import socket
 import uuid
 import os
 import signal
+import subprocess
+import sys
 import threading
 import time
 
@@ -28,7 +30,9 @@ import pytest
 import requests
 
 from gcl_looper.services import bjoern_service
+from gcl_looper.services import basic
 from gcl_looper.services import hub
+from gcl_looper.services import reload_control
 
 HOST = "127.0.0.1"
 
@@ -70,6 +74,19 @@ def _get(port):
     return version, int(pid)
 
 
+class _PidProbe(basic.BasicService):
+    def __init__(self, marker):
+        super().__init__()
+        self.marker = marker
+
+    def _setup(self):
+        with self.marker.open("a") as stream:
+            stream.write(f"{os.getpid()}\n")
+
+    def _iteration(self):
+        pass
+
+
 def _wait_for(predicate, timeout=30):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -86,15 +103,20 @@ def _wait_for(predicate, timeout=30):
 def running_hub(tmp_path):
     started = []
 
-    def start(port, workers=2, iter_min_period=0.1):
+    def start(port, workers=2, iter_min_period=0.1, background=None, **options):
         version_file = tmp_path / "version"
         version_file.write_text("v1")
         h = hub.ReloadableProcessHubService(
-            iter_min_period=iter_min_period, ready_timeout=15, drain_timeout=5
+            iter_min_period=iter_min_period,
+            ready_timeout=15,
+            drain_timeout=5,
+            **options,
         )
         h.should_subscribe_signals = False
         for _ in range(workers):
             h.add_service_factory(functools.partial(_build_worker, version_file, port))
+        if background is not None:
+            h.add_background_service_factory(background)
         thread = threading.Thread(target=h.start)
         thread.start()
         started.append((h, thread))
@@ -166,11 +188,7 @@ def test_failed_reload_keeps_old_workers(running_hub):
     old_pids = {i.pid for i in h._instances.values()}
 
     version_file.write_text("broken")
-    done = h._iteration_number
-    h.reload()
-    # The iteration running now may have missed the request; the next one
-    # handles it, and the reload is over once that one finishes.
-    _wait_for(lambda: h._iteration_number > done + 1)
+    assert h.reload().result(timeout=10) is False
 
     assert {i.pid for i in h._instances.values()} == old_pids
     assert all(i.is_alive() for i in h._instances.values())
@@ -178,8 +196,119 @@ def test_failed_reload_keeps_old_workers(running_hub):
 
     # A fixed release goes through afterwards.
     version_file.write_text("v3")
-    h.reload()
-    _wait_for(lambda: _get(port)[0] == "v3")
+    assert h.reload().result(timeout=10) is True
+    assert _get(port)[0] == "v3"
+
+
+def test_background_factory_starts_once_and_survives_reload(running_hub, tmp_path):
+    with socket.socket() as listener:
+        listener.bind((HOST, 0))
+        port = listener.getsockname()[1]
+    marker = tmp_path / "background"
+    h, version_file = running_hub(port, background=functools.partial(_PidProbe, marker))
+    _wait_for(marker.exists)
+    pid = int(marker.read_text())
+
+    version_file.write_text("v2")
+    assert h.reload().result(timeout=10) is True
+
+    assert marker.read_text() == f"{pid}\n"
+    os.kill(pid, 0)
+
+
+def test_reload_socket_reports_success_and_failure(running_hub, tmp_path):
+    with socket.socket() as listener:
+        listener.bind((HOST, 0))
+        port = listener.getsockname()[1]
+    path = tmp_path / "reload.sock"
+    h, version_file = running_hub(port, reload_socket=path, iter_min_period=60)
+    _wait_for(lambda: h._iteration_number >= 1)
+    assert path.stat().st_mode & 0o777 == 0o600
+    # A second supervisor cannot take over the live reload socket.
+    second = hub.ReloadableProcessHubService(reload_socket=path)
+    second.should_subscribe_signals = False
+    with pytest.raises(OSError):
+        second.start()
+
+    version_file.write_text("broken")
+    assert reload_control.request_reload(path, timeout=10) is False
+    assert _get(port)[0] == "v1"
+
+    version_file.write_text("v2")
+    assert reload_control.request_reload(path, timeout=10) is True
+    assert _get(port)[0] == "v2"
+
+    h.stop()
+    _wait_for(lambda: not path.exists())
+
+
+def test_reload_socket_recovers_after_unclean_shutdown(tmp_path):
+    path = tmp_path / "reload.sock"
+    runner = (
+        "import sys; from gcl_looper.services.hub import ReloadableProcessHubService; "
+        "ReloadableProcessHubService(reload_socket=sys.argv[1]).start()"
+    )
+    process = subprocess.Popen([sys.executable, "-c", runner, os.fspath(path)])
+    try:
+
+        def old_hub_responds():
+            try:
+                return reload_control.request_reload(path, timeout=2)
+            except OSError:
+                return False
+
+        _wait_for(old_hub_responds, timeout=10)
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+    assert path.is_socket()
+
+    marker = tmp_path / "worker-pids"
+    service = hub.ReloadableProcessHubService(reload_socket=path)
+    service.should_subscribe_signals = False
+    service.add_service_factory(functools.partial(_PidProbe, marker))
+    thread = threading.Thread(target=service.start)
+    thread.start()
+    try:
+        _wait_for(lambda: marker.exists() and marker.read_text().strip(), timeout=10)
+        assert reload_control.request_reload(path, timeout=10)
+        first, replacement = marker.read_text().splitlines()
+        assert first != replacement
+    finally:
+        service.stop()
+        thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert not path.exists()
+
+
+def test_reload_socket_preserves_a_live_unrelated_listener(tmp_path):
+    path = tmp_path / "reload.sock"
+    service = hub.ReloadableProcessHubService(reload_socket=path)
+    service.should_subscribe_signals = False
+
+    with socket.socket(socket.AF_UNIX) as existing:
+        existing.bind(os.fspath(path))
+        existing.listen()
+        original = path.stat()
+        with pytest.raises(OSError):
+            service.start()
+        assert os.path.samestat(original, path.stat())
+
+
+def test_reload_socket_preserves_a_symlink(tmp_path):
+    target = tmp_path / "target"
+    target.write_text("keep")
+    path = tmp_path / "reload.sock"
+    path.symlink_to(target)
+    service = hub.ReloadableProcessHubService(reload_socket=path)
+    service.should_subscribe_signals = False
+
+    with pytest.raises(OSError):
+        service.start()
+
+    assert os.readlink(path) == os.fspath(target)
+    assert target.read_text() == "keep"
 
 
 def test_reload_wakes_the_hub_up(running_hub):

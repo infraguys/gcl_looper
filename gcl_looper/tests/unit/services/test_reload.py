@@ -450,6 +450,70 @@ def test_partial_launch_failure_drains_started_groups():
     assert list(service._drain.call_args.args[0]) == [first]
 
 
+def test_request_during_cutover_reports_its_own_generation():
+    service = hub.ReloadableProcessHubService()
+    service._enabled = service._initial_ready = True
+    first = service.reload()
+    later = []
+
+    def failed_replacement():
+        later.append(service.reload())
+        return False
+
+    service._reload = mock.Mock(side_effect=failed_replacement)
+    service._iteration()
+    assert first.result(timeout=0) is False
+    assert not later[0].done()
+    service._clear_iteration_wake()
+    assert service._wake_event.is_set()
+
+    service._reload.side_effect = None
+    service._reload.return_value = True
+    service._iteration()
+    assert later[0].result(timeout=0) is True
+
+
+def test_shutdown_resolves_pending_and_later_reload_requests():
+    service = hub.ReloadableProcessHubService()
+    pending = service.reload()
+    service._finish()
+    assert pending.result(timeout=0) is False
+    assert service.reload().result(timeout=0) is False
+
+
+def test_background_failure_takes_priority_over_clean_worker_exit():
+    service = hub.ReloadableProcessHubService()
+    service._enabled = service._initial_ready = True
+    worker = mock.Mock(pid=1, exitcode=0)
+    background = mock.Mock(pid=2, exitcode=7)
+    worker.is_alive.return_value = background.is_alive.return_value = False
+    service._instances = {0: worker}
+    service._background_instances = [background]
+
+    service._iteration()
+
+    assert not service._enabled
+    assert service._failure == "Child service 2 exited with code 7"
+
+
+def test_background_spawn_failure_cleans_up_workers_and_socket(tmp_path):
+    path = tmp_path / "reload.sock"
+    service = hub.ReloadableProcessHubService(reload_socket=path)
+    service.should_subscribe_signals = False
+    service.add_background_service_factory(os.getpid)
+    worker = mock.Mock()
+    service._spawn_generation = mock.Mock(return_value={0: worker})
+    service._spawn = mock.Mock(side_effect=OSError("spawn failed"))
+    service._drain = mock.Mock()
+
+    with pytest.raises(OSError, match="spawn failed"):
+        service.start()
+
+    assert list(service._drain.call_args.args[0]) == [worker]
+    assert not path.exists()
+    assert service.reload().result(timeout=0) is False
+
+
 def test_prefork_rejects_mixed_worker_privileges():
     services = [hub.ReloadableProcessHubService(), hub.ReloadableProcessHubService()]
     services[0].__mp_downgrade_user__ = None

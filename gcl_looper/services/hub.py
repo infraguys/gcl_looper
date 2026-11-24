@@ -14,9 +14,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import multiprocessing
+from concurrent.futures import Future
 import functools
+from itertools import chain
 import math
+import multiprocessing
 import pickle
 import select
 import subprocess
@@ -29,6 +31,7 @@ import time
 
 from gcl_looper.services import base
 from gcl_looper.services import basic
+from gcl_looper.services import reload_control
 from gcl_looper import utils
 
 LOG = logging.getLogger(__name__)
@@ -73,15 +76,21 @@ class ProcessHubService(BasicHubService):
         super().add_service(service)
 
     def _iteration(self):
-        for instance in self._instances.values():
+        for instance in self._children():
             if not instance.is_alive():
-                LOG.error(
-                    "Child service(pid:%i) is not running, exit code %r, let's stop",
-                    instance.pid,
-                    instance.exitcode,
-                )
-                self.stop()
+                self._child_exited(instance)
                 return
+
+    def _children(self):
+        return self._instances.values()
+
+    def _child_exited(self, instance):
+        LOG.error(
+            "Child service(pid:%i) is not running, exit code %r, let's stop",
+            instance.pid,
+            instance.exitcode,
+        )
+        self.stop()
 
     def _setup(self):
         for service in self._services:
@@ -389,6 +398,8 @@ class ReloadableProcessHubService(ProcessHubService):
         drain_timeout=30,
         autoreload=False,
         reload_dirs=(),
+        reload_socket=None,
+        allow_clean_worker_exit=True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -396,7 +407,19 @@ class ReloadableProcessHubService(ProcessHubService):
         self._ready_deadline = None
         self._drain_timeout = drain_timeout
         self._factories = []
+        self._background_factories = []
+        self._background_instances = []
+        self._allow_clean_worker_exit = allow_clean_worker_exit
         self._reload_requested = False
+        self._reload_lock = threading.Lock()
+        self._reload_requests = []
+        self._accept_reloads = True
+        self._reload_listener = (
+            reload_control._Listener(reload_socket)
+            if reload_socket is not None
+            else None
+        )
+        self._failure = None
         self._stop_deadline = None
         self.autoreload = autoreload
         self._load_source = autoreload
@@ -513,7 +536,7 @@ class ReloadableProcessHubService(ProcessHubService):
             self._sources = sources
             if not initial:
                 LOG.info("Source changes detected, reloading services")
-                self.reload()
+                self._reload_requested = True
 
     def add_service(self, service):
         raise TypeError(
@@ -525,11 +548,49 @@ class ReloadableProcessHubService(ProcessHubService):
         """Add a factory building one worker service."""
         self._factories.append(factory)
 
+    def add_background_service_factory(self, factory):
+        """Add a supervised service that keeps running across worker reloads."""
+        self._background_factories.append(factory)
+
     def reload(self):
-        """Request a reload; it runs on the next hub iteration."""
+        """Request a reload and return a Future resolving to its success."""
+        result = Future()
+        with self._reload_lock:
+            if not self._accept_reloads:
+                result.set_result(False)
+                return result
+            self._reload_requests.append(result)
         LOG.info("Reload requested")
+        self._wake_event.set()
+        return result
+
+    def start(self):
+        super().start()
+        if self._failure is not None:
+            raise RuntimeError(self._failure)
+
+    def _signal_reload(self, signum, frame):
         self._reload_requested = True
         self._wake_event.set()
+
+    def _clear_iteration_wake(self):
+        with self._reload_lock:
+            if not self._reload_requests and not self._reload_requested:
+                super()._clear_iteration_wake()
+
+    def _take_reload_requests(self, *, closing=False):
+        with self._reload_lock:
+            if closing:
+                self._accept_reloads = False
+            requests = self._reload_requests
+            self._reload_requests = []
+        return requests
+
+    @staticmethod
+    def _complete_reload_requests(requests, success):
+        for request in requests:
+            if request.set_running_or_notify_cancel():
+                request.set_result(success)
 
     def _spawn(self, factory):
         return _ServiceProcess(
@@ -562,18 +623,31 @@ class ReloadableProcessHubService(ProcessHubService):
     def _setup(self):
         if self.should_subscribe_signals:
             handlers = self._get_sig_handlers()
-            handlers[signal.SIGHUP] = lambda s, frame: self.reload()
+            handlers[signal.SIGHUP] = self._signal_reload
             self._subscribe_signals(handlers)
+        if self._reload_listener is not None:
+            self._reload_listener.open(self.reload)
         self._check_source_changes(initial=True)
         try:
             self._instances = self._spawn_generation()
+            for factory in self._background_factories:
+                if self._stop_event.is_set():
+                    break
+                self._background_instances.append(self._spawn(factory))
         except InterruptedError:
             if not self._stop_event.is_set():
                 raise
 
-    def _starting_group_failed(self, instance):
+    def _starting_group_failed(self, instance, allow_completed=False):
         exitcode = instance.exitcode
         if exitcode is None and not instance.ready.has_failed():
+            return False
+        if (
+            exitcode == 0
+            and allow_completed
+            and instance not in self._background_instances
+            and instance.ready.is_set()
+        ):
             return False
         LOG.error(
             "New generation group(pid:%i) failed before cutover, exit code %r",
@@ -582,15 +656,17 @@ class ReloadableProcessHubService(ProcessHubService):
         )
         return True
 
-    def _wait_ready(self, generation):
+    def _wait_ready(self, generation, *, allow_completed=False):
+        instances = generation.values()
+        failed = functools.partial(
+            self._starting_group_failed, allow_completed=allow_completed
+        )
         deadline = self._ready_deadline
         if deadline is None:
             deadline = time.monotonic() + self._ready_timeout
-        for instance in generation.values():
+        for instance in instances:
             while not instance.ready.wait(timeout=0.1):
-                if any(
-                    self._starting_group_failed(group) for group in generation.values()
-                ):
+                if any(failed(group) for group in instances):
                     return False
                 if not self._enabled:
                     return False
@@ -601,10 +677,7 @@ class ReloadableProcessHubService(ProcessHubService):
                         self._ready_timeout,
                     )
                     return False
-        return (
-            not any(self._starting_group_failed(group) for group in generation.values())
-            and self._enabled
-        )
+        return self._enabled and not any(failed(group) for group in instances)
 
     def _drain(self, instances):
         """SIGTERM the workers, kill the ones still alive after drain_timeout."""
@@ -641,13 +714,18 @@ class ReloadableProcessHubService(ProcessHubService):
             generation = self._spawn_generation()
         except Exception:
             LOG.exception("Reload failed to launch, the current workers keep serving")
-            return
+            return False
 
-        if not self._wait_ready(generation):
+        try:
+            ready = self._wait_ready(generation)
+        except BaseException:
+            self._drain(generation.values())
+            raise
+        if not ready or not self._enabled:
             self._drain(generation.values())
             if self._enabled:
                 LOG.error("Reload failed, the current workers keep serving")
-            return
+            return False
 
         old = self._instances
         self._instances = generation
@@ -656,6 +734,26 @@ class ReloadableProcessHubService(ProcessHubService):
             ", ".join(str(i.pid) for i in generation.values()),
         )
         self._drain(old.values())
+        return True
+
+    def _children(self):
+        return chain(super()._children(), self._background_instances)
+
+    def _child_exited(self, instance):
+        for child in self._children():
+            if child.is_alive():
+                continue
+            if (
+                child.exitcode != 0
+                or not self._allow_clean_worker_exit
+                or child in self._background_instances
+            ):
+                self._failure = (
+                    f"Child service {child.pid} exited with code {child.exitcode}"
+                )
+                instance = child
+                break
+        super()._child_exited(instance)
 
     def _iteration(self):
         # Keep a stop requested in setup across BasicService._loop's reset.
@@ -664,13 +762,24 @@ class ReloadableProcessHubService(ProcessHubService):
             return
         if not self._initial_ready:
             self._initial_ready = True
-            if not self._wait_ready(self._instances):
+            if not self._wait_ready(
+                dict(enumerate(self._children())),
+                allow_completed=self._allow_clean_worker_exit,
+            ):
+                if self._enabled:
+                    self._failure = "Initial worker generation did not become ready"
                 self.stop()
                 return
         self._check_source_changes()
-        if self._reload_requested and self._enabled:
-            self._reload()
-        super()._iteration()
+        requests = self._take_reload_requests()
+        replaced = False
+        try:
+            if (self._reload_requested or requests) and self._enabled:
+                replaced = self._reload()
+            if self._enabled:
+                super()._iteration()
+        finally:
+            self._complete_reload_requests(requests, bool(replaced and self._enabled))
 
     def stop(self):
         # Only flag the loop to exit: stop() may come from a signal handler or
@@ -684,8 +793,13 @@ class ReloadableProcessHubService(ProcessHubService):
     def _finish(self):
         # Unlike the base hub, don't wait for the workers forever: a keep-alive
         # client holds a draining bjoern worker until it disconnects.
-        self._drain(self._instances.values())
-        super()._finish()
+        self._complete_reload_requests(self._take_reload_requests(closing=True), False)
+        try:
+            self._drain(self._children())
+        finally:
+            if self._reload_listener is not None:
+                self._reload_listener.close()
+            super()._finish()
 
 
 class _PreforkGeneration(ReloadableProcessHubService):
